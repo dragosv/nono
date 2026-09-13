@@ -68,8 +68,8 @@ pub mod undo;
 pub use broker_path::{sanitize_broker_path, sanitize_broker_path_for_binary, writable_path_dirs};
 pub use capability::{
     AccessMode, CapabilitySet, CapabilitySource, CoveringCapabilities, FsCapability, IpcMode,
-    NetworkMode, ProcessInfoMode, SignalMode, SocketScope, UnixSocketCapability, UnixSocketMode,
-    UnixSocketOp,
+    NetworkMode, ProcessExecMode, ProcessInfoMode, SignalMode, SocketScope, UnixSocketCapability,
+    UnixSocketMode, UnixSocketOp,
 };
 pub use diagnostic::{
     DenialReason, DenialRecord, IpcDenialRecord, NonoDiagnostic, NonoDiagnosticCode,

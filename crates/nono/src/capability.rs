@@ -824,6 +824,44 @@ pub enum SignalMode {
     AllowAll,
 }
 
+/// Process execution scope for the sandbox.
+///
+/// Controls which files the sandboxed process may `execve`. Landlock folds
+/// execute into the filesystem grants — [`AccessMode::Read`] maps to
+/// `ReadFile | ReadDir | Execute` — so on Linux a path with no read grant
+/// cannot be executed. Seatbelt treats `process-exec` as an operation
+/// separate from `file-read*`, and the profile has always granted it
+/// unconditionally, so on macOS a binary at an ungranted path executes while
+/// its own image stays unreadable.
+///
+/// This cannot be layered on afterwards the way `Sandbox::restrict_execute`
+/// (Linux only) stacks a second Landlock ruleset: `sandbox_init()` refuses a
+/// second profile (`EPERM`, measured on macOS 15), so the scope has to be part
+/// of the single profile that is applied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessExecMode {
+    /// Any file may be executed, regardless of filesystem grants.
+    ///
+    /// On macOS: emits `(allow process-exec*)`.
+    ///
+    /// On Linux: no-op — execute is already implied by, and only by, a read
+    /// grant, so this mode cannot widen what Landlock enforces.
+    #[default]
+    Unrestricted,
+    /// Only files under a path with [`AccessMode::Read`] or
+    /// [`AccessMode::ReadWrite`] access may be executed.
+    ///
+    /// On macOS: emits `(allow process-exec* (subpath|literal "..."))` per
+    /// read-granted path, for both the original and the resolved path, in
+    /// place of the unconditional rule. Paths reachable only through a
+    /// `$PATH` metadata grant or a runtime extension token get no exec rule.
+    /// `execve` of anything else fails with `EPERM`, the same point at which
+    /// Landlock refuses it.
+    ///
+    /// On Linux: no-op — this is already how [`AccessMode::Read`] behaves.
+    ReadGranted,
+}
+
 /// Process inspection mode for the sandbox.
 ///
 /// Controls whether the sandboxed process can read process information
@@ -989,6 +1027,8 @@ pub struct CapabilitySet {
     signal_mode: SignalMode,
     /// Process inspection mode (default: Isolated).
     process_info_mode: ProcessInfoMode,
+    /// Process execution scope (default: Unrestricted).
+    process_exec_mode: ProcessExecMode,
     /// IPC mode (default: SharedMemoryOnly).
     ipc_mode: IpcMode,
     /// Enable sandbox extension support for runtime capability expansion.
@@ -1252,6 +1292,16 @@ impl CapabilitySet {
         self
     }
 
+    /// Set process execution scope (builder pattern)
+    ///
+    /// Controls whether the sandboxed process may `execve` files outside its
+    /// read grants. See [`ProcessExecMode`].
+    #[must_use]
+    pub fn set_process_exec_mode(mut self, mode: ProcessExecMode) -> Self {
+        self.process_exec_mode = mode;
+        self
+    }
+
     /// Set IPC mode (builder pattern)
     ///
     /// Controls whether the sandboxed process can use POSIX semaphores.
@@ -1373,6 +1423,11 @@ impl CapabilitySet {
     /// Set process inspection mode (mutable)
     pub fn set_process_info_mode_mut(&mut self, mode: ProcessInfoMode) {
         self.process_info_mode = mode;
+    }
+
+    /// Set process execution scope (mutable)
+    pub fn set_process_exec_mode_mut(&mut self, mode: ProcessExecMode) {
+        self.process_exec_mode = mode;
     }
 
     /// Set IPC mode (mutable)
@@ -1633,6 +1688,12 @@ impl CapabilitySet {
     #[must_use]
     pub fn process_info_mode(&self) -> ProcessInfoMode {
         self.process_info_mode
+    }
+
+    /// Get the process execution scope
+    #[must_use]
+    pub fn process_exec_mode(&self) -> ProcessExecMode {
+        self.process_exec_mode
     }
 
     /// Get the IPC mode
@@ -3277,6 +3338,22 @@ mod tests {
     fn test_signal_mode_allow_same_sandbox_roundtrip() {
         let caps = CapabilitySet::new().set_signal_mode(SignalMode::AllowSameSandbox);
         assert_eq!(caps.signal_mode(), SignalMode::AllowSameSandbox);
+    }
+
+    #[test]
+    fn test_process_exec_mode_default_is_unrestricted() {
+        let caps = CapabilitySet::new();
+        assert_eq!(caps.process_exec_mode(), ProcessExecMode::Unrestricted);
+    }
+
+    #[test]
+    fn test_process_exec_mode_read_granted() {
+        let caps = CapabilitySet::new().set_process_exec_mode(ProcessExecMode::ReadGranted);
+        assert_eq!(caps.process_exec_mode(), ProcessExecMode::ReadGranted);
+
+        let mut caps = CapabilitySet::new();
+        caps.set_process_exec_mode_mut(ProcessExecMode::ReadGranted);
+        assert_eq!(caps.process_exec_mode(), ProcessExecMode::ReadGranted);
     }
 
     #[test]

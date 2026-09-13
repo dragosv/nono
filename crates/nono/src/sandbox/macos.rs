@@ -6,7 +6,8 @@
 //! - Implementing any security policy (sensitive path blocking, etc.)
 
 use crate::capability::{
-    AccessMode, CapabilitySet, MACOS_PORT_RANGE_LIMIT, NetworkMode, merge_port_ranges,
+    AccessMode, CapabilitySet, MACOS_PORT_RANGE_LIMIT, NetworkMode, ProcessExecMode,
+    merge_port_ranges,
 };
 use crate::error::{NonoError, Result};
 use crate::path::collect_symlink_hops;
@@ -581,8 +582,30 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push_str("(debug deny)\n");
     }
 
-    // Allow specific process operations needed for execution
-    profile.push_str("(allow process-exec*)\n");
+    // Allow specific process operations needed for execution.
+    //
+    // Seatbelt checks `process-exec` independently of `file-read*`, so the
+    // unconditional form lets a binary at an ungranted path execute (with its
+    // own image unreadable). `ReadGranted` instead scopes exec to the read
+    // set, which is what Landlock does implicitly (AccessMode::Read carries
+    // AccessFs::Execute). It has to be decided here, in the one profile
+    // `sandbox_init()` accepts: a second `sandbox_init()` from an already
+    // sandboxed process returns EPERM, so there is no macOS analogue of
+    // stacking `restrict_execute` after `apply`.
+    match caps.process_exec_mode() {
+        ProcessExecMode::Unrestricted => {
+            profile.push_str("(allow process-exec*)\n");
+        }
+        ProcessExecMode::ReadGranted => {
+            for cap in caps.fs_capabilities() {
+                if matches!(cap.access, AccessMode::Read | AccessMode::ReadWrite) {
+                    for filter in path_filters_for_cap(cap)? {
+                        profile.push_str(&format!("(allow process-exec* ({}))\n", filter));
+                    }
+                }
+            }
+        }
+    }
     profile.push_str("(allow process-fork)\n");
 
     // Process info: allow self-inspection and same-sandbox inspection for both
@@ -1155,6 +1178,148 @@ mod tests {
 
         // Must not contain a global (unrestricted) file-map-executable
         assert!(!profile.contains("(allow file-map-executable)\n"));
+    }
+
+    #[test]
+    fn test_generate_profile_process_exec_unrestricted_by_default() {
+        let caps = CapabilitySet::new()
+            .allow_path("/usr", AccessMode::Read)
+            .unwrap();
+        assert_eq!(caps.process_exec_mode(), ProcessExecMode::Unrestricted);
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow process-exec*)\n"));
+        assert!(!profile.contains("(allow process-exec* ("));
+    }
+
+    #[test]
+    fn test_generate_profile_process_exec_read_granted_scopes_to_read_set() {
+        let caps = CapabilitySet::new()
+            .allow_path("/usr", AccessMode::Read)
+            .unwrap()
+            .allow_path("/tmp", AccessMode::ReadWrite)
+            .unwrap()
+            .allow_path("/private/var/folders", AccessMode::Write)
+            .unwrap()
+            .set_process_exec_mode(ProcessExecMode::ReadGranted);
+
+        let profile = generate_profile(&caps).unwrap();
+
+        // The unconditional rule is gone; only the read set is executable.
+        assert!(!profile.contains("(allow process-exec*)\n"));
+        assert!(profile.contains("(allow process-exec* (subpath \"/usr\"))\n"));
+        // Both spellings of a symlinked grant, as for file-read*.
+        assert!(profile.contains("(allow process-exec* (subpath \"/private/tmp\"))\n"));
+        assert!(profile.contains("(allow process-exec* (subpath \"/tmp\"))\n"));
+        // A write-only grant is not an exec grant.
+        assert!(!profile.contains("(allow process-exec* (subpath \"/private/var/folders\"))"));
+        // Fork is unaffected by the mode.
+        assert!(profile.contains("(allow process-fork)\n"));
+    }
+
+    #[test]
+    fn test_generate_profile_process_exec_read_granted_file_grant_is_literal() {
+        let caps = CapabilitySet::new()
+            .allow_file("/usr/bin/true", AccessMode::Read)
+            .unwrap()
+            .set_process_exec_mode(ProcessExecMode::ReadGranted);
+
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow process-exec* (literal \"/usr/bin/true\"))\n"));
+        assert!(!profile.contains("(allow process-exec* (subpath"));
+    }
+
+    /// What `execv` in a forked child under `caps` comes back with: the exit
+    /// status of the exec'd program, or a distinct code if `execv` itself
+    /// returned. Exit codes: 3 = sandbox apply failed, 4 = `execv` returned
+    /// with an errno other than `EPERM`, 5 = `execv` returned `EPERM`.
+    fn exec_under(caps: &CapabilitySet, argv: &[&str]) -> i32 {
+        let c_args: Vec<std::ffi::CString> = argv
+            .iter()
+            .map(|a| std::ffi::CString::new(*a).unwrap())
+            .collect();
+        let mut c_argv: Vec<*const c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
+        c_argv.push(ptr::null());
+
+        // SAFETY: the child only calls async-signal-safe functions (`execv`,
+        // `_exit`) after the sandbox is applied, and the parent waits on it.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+        if pid == 0 {
+            if apply(caps).is_err() {
+                unsafe { libc::_exit(3) };
+            }
+            unsafe { libc::execv(c_argv[0], c_argv.as_ptr()) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            let code = if errno == Some(libc::EPERM) { 5 } else { 4 };
+            unsafe { libc::_exit(code) };
+        }
+
+        let mut status: i32 = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid() failed");
+        assert!(
+            libc::WIFEXITED(status),
+            "child did not exit normally: status={status}"
+        );
+        libc::WEXITSTATUS(status)
+    }
+
+    /// Read grants a dynamically linked binary needs to start, deliberately
+    /// omitting `/bin` so that `/bin/sh` is a reachable-but-ungranted target.
+    fn dyld_read_caps(extra: &Path) -> CapabilitySet {
+        let mut caps = CapabilitySet::new()
+            .allow_path(extra, AccessMode::Read)
+            .unwrap();
+        for dir in ["/usr", "/System", "/Library", "/private", "/dev"] {
+            caps = caps.allow_path(dir, AccessMode::Read).unwrap();
+        }
+        caps
+    }
+
+    #[test]
+    fn test_apply_process_exec_read_granted_refuses_ungranted_binary() {
+        if !is_supported() {
+            return;
+        }
+        // A private copy of a system binary inside the one directory the
+        // sandbox is granted, so "granted" and "ungranted" differ only in path.
+        let root = std::env::temp_dir().join(format!(
+            "nono-process-exec-mode-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create test root");
+        let granted_true = root.join("true");
+        std::fs::copy("/usr/bin/true", &granted_true).expect("copy /usr/bin/true");
+        let granted_true = granted_true.to_str().expect("utf-8 path");
+
+        let scoped = dyld_read_caps(&root).set_process_exec_mode(ProcessExecMode::ReadGranted);
+        let unrestricted = dyld_read_caps(&root);
+
+        let granted = exec_under(&scoped, &[granted_true]);
+        let ungranted = exec_under(&scoped, &["/bin/sh", "-c", "exit 7"]);
+        // Control: the same grants without the mode still run /bin/sh, so the
+        // refusal above is the mode's doing and not some other rule's.
+        let control = exec_under(&unrestricted, &["/bin/sh", "-c", "exit 7"]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            granted, 0,
+            "a binary inside a read grant must still execute and run under ReadGranted \
+             (exit code {granted}; 3=apply failed, 4/5=execv returned)"
+        );
+        assert_eq!(
+            ungranted, 5,
+            "a binary outside every read grant must be refused at execve with EPERM under \
+             ReadGranted (exit code {ungranted}; 7=it ran, 3=apply failed, 4=other errno)"
+        );
+        assert_eq!(
+            control, 7,
+            "control: the same grants under Unrestricted must still run /bin/sh \
+             (exit code {control})"
+        );
     }
 
     #[test]
