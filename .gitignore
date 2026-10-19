@@ -21,3 +21,6 @@ bindings/node/node_modules*
 # Nix build artifacts
 /result
 /result-*
+
+# OpenSpec tooling (npm)
+/node_modules/
