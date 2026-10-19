@@ -1,0 +1,14 @@
+# Throwaway validation spike for openspec change
+# `add-windows-processcontainer-backend` (tasks 1.x). Not a workspace member
+# and not intended to merge.
+[package]
+name = "windows-psec-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+mxc-sdk = "=1.0.1"
+serde_json = "1"
+
+[workspace]
