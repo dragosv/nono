@@ -1815,7 +1815,10 @@ impl CapabilitySet {
             // Platform-specific dedup key (see comment above).
             #[cfg(target_os = "macos")]
             let key = (cap.original.clone(), cap.is_file);
-            #[cfg(target_os = "linux")]
+            // Windows keys on the resolved path like Linux: PSEC resolves
+            // junctions and symlinks to their targets before applying grants,
+            // so two literal paths to one target receive the union of access.
+            #[cfg(not(target_os = "macos"))]
             let key = (cap.resolved.clone(), cap.is_file);
 
             if let Some(&existing_idx) = seen.get(&key) {
@@ -2278,6 +2281,7 @@ mod procfs_remap_tests {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
     use tempfile::tempdir;
 
@@ -2304,6 +2308,7 @@ mod tests {
         assert!(cap.is_file);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_fs_capability_accepts_non_directory_nodes() {
         use nix::sys::stat::Mode;
@@ -2848,6 +2853,7 @@ mod tests {
         assert!(matches!(surviving.source, CapabilitySource::User));
     }
 
+    #[cfg(unix)]
     #[cfg(unix)]
     #[test]
     fn test_fs_capability_symlink_resolution() {
@@ -3480,6 +3486,7 @@ mod tests {
         assert!(!caps.path_covered_with_access(&file_canonical, AccessMode::Read));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_remove_exact_file_caps_for_paths_matches_original_and_resolved() {
         let dir = tempdir().unwrap();
@@ -3526,6 +3533,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_unix_socket_connect_on_existing_socket() {
         let dir = tempdir().unwrap();
@@ -3538,6 +3546,7 @@ mod tests {
         assert!(cap.resolved.is_absolute());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_unix_socket_file_resolves_symlink_to_socket() {
         let dir = tempdir().unwrap();
@@ -3561,6 +3570,7 @@ mod tests {
         assert!(matches!(result, Err(NonoError::ExpectedUnixSocket(_))));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_unix_socket_file_rejects_fifo_and_device() {
         use nix::sys::stat::Mode;
@@ -3670,6 +3680,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_unix_socket_covers_file_exact_match() {
         let dir = tempdir().unwrap();
@@ -3734,6 +3745,7 @@ mod tests {
         assert!(!cap.covers(&evil), "string-prefix match must not leak");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_unix_socket_display() {
         let dir = tempdir().unwrap();
@@ -3757,6 +3769,7 @@ mod tests {
         assert!(rendered.starts_with("dir-subtree "));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_capability_set_allow_unix_socket_accumulates() {
         let dir = tempdir().unwrap();
@@ -3781,6 +3794,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_capability_set_unix_socket_allowed_mode_split() {
         // Invariant `separate-read-write`: Connect entries must not
@@ -3854,6 +3868,7 @@ mod tests {
 
     /// Send (sendto/sendmsg/sendmmsg) is covered by Connect grants (issue #1089).
     /// A Connect-mode grant allows both connect and datagram send operations.
+    #[cfg(unix)]
     #[test]
     fn test_capability_set_unix_socket_send_covered_by_connect_grant() {
         let dir = tempdir().unwrap();
@@ -3874,6 +3889,7 @@ mod tests {
         assert!(!caps.unix_socket_allowed(&resolved, UnixSocketOp::Bind));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_deduplicate_unix_sockets_merges_identical_grants() {
         let dir = tempdir().unwrap();
@@ -3891,6 +3907,7 @@ mod tests {
         assert_eq!(caps.unix_socket_capabilities().len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_deduplicate_unix_sockets_promotes_connect_to_connect_bind() {
         // When Connect and ConnectBind grants collide on the same resolved
@@ -3911,6 +3928,7 @@ mod tests {
         assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_deduplicate_unix_sockets_does_not_widen_user_intent() {
         // Security-critical: a user explicitly narrowing a path to
@@ -3950,6 +3968,7 @@ mod tests {
         assert!(matches!(socks[0].source, CapabilitySource::User));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_deduplicate_unix_sockets_keeps_file_and_dir_grants_separate() {
         // File grant on /path/foo.sock and dir grant on /path/ are
@@ -3968,6 +3987,7 @@ mod tests {
         assert_eq!(caps.unix_socket_capabilities().len(), 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_summary_includes_unix_sockets() {
         let dir = tempdir().unwrap();

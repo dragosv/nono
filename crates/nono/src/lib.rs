@@ -97,6 +97,10 @@ pub use resource::ResourceLimits;
 pub use sandbox::{
     DetectedAbi, LandlockScopePolicy, SeccompOpts, detect_abi, is_wsl2, landlock_scope_policy,
 };
+#[cfg(target_os = "windows")]
+pub use sandbox::{
+    LaunchOptions, LaunchStdio, RenderedNetwork, RenderedPolicy, SandboxedChild, WindowsSupport,
+};
 pub use sandbox::{Sandbox, SupportInfo};
 pub use scrub::{
     ScrubPolicy, ScrubPolicyDiff, scrub_argv, scrub_argv_with_policy, scrub_env_name,
@@ -105,9 +109,10 @@ pub use scrub::{
 };
 pub use state::SandboxState;
 pub use supervisor::{
-    ApprovalBackend, ApprovalDecision, ApprovalRequest, CapabilityRequest, SupervisorListener,
-    SupervisorSocket, UrlOpenRequest,
+    ApprovalBackend, ApprovalDecision, ApprovalRequest, CapabilityRequest, UrlOpenRequest,
 };
+#[cfg(unix)]
+pub use supervisor::{SupervisorListener, SupervisorSocket};
 pub use trust::{
     Enforcement, IncludePatterns, Publisher, SignerIdentity, TrustPolicy, VerificationOutcome,
     VerificationResult,

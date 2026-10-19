@@ -586,6 +586,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn drops_entry_with_null_byte_gracefully() {
         // An embedded NUL must be rejected explicitly, not left to whatever

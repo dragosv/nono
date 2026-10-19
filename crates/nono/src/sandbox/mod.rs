@@ -14,6 +14,14 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(target_os = "windows")]
+pub use windows::{
+    LaunchOptions, LaunchStdio, RenderedNetwork, RenderedPolicy, SandboxedChild, WindowsSupport,
+};
+
 // Re-export macOS extension functions for supervisor use
 #[cfg(target_os = "macos")]
 pub use macos::{extension_consume, extension_issue_file, extension_release};
@@ -192,6 +200,46 @@ impl Sandbox {
         linux::restrict_execute(paths)
     }
 
+    /// Launch `options.program` confined by `caps` (Windows).
+    ///
+    /// Windows has no self-restriction equivalent to [`Sandbox::apply_auto`];
+    /// the workload is started inside a Windows ProcessContainer (PSEC) and a
+    /// kill-on-close Job Object instead. The process is created suspended and
+    /// resumed only after both are in place. Every capability field is either
+    /// enforced or rejected with an error; the launch fails if PSEC is
+    /// unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a capability cannot be expressed, a path fails
+    /// validation, the environment lacks `SYSTEMROOT` or `LOCALAPPDATA`, PSEC
+    /// is unavailable, or any launch step fails.
+    #[cfg(target_os = "windows")]
+    #[must_use = "dropping the child terminates it"]
+    pub fn launch(caps: &CapabilitySet, options: &LaunchOptions) -> Result<SandboxedChild> {
+        windows::launch(caps, options)
+    }
+
+    /// The policy [`Sandbox::launch`] would apply, without launching (Windows).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Sandbox::launch`].
+    #[cfg(target_os = "windows")]
+    pub fn render_launch_policy(
+        caps: &CapabilitySet,
+        options: &LaunchOptions,
+    ) -> Result<RenderedPolicy> {
+        windows::render(caps, options)
+    }
+
+    /// Probe Windows PSEC support on this host (Windows).
+    #[cfg(target_os = "windows")]
+    #[must_use]
+    pub fn windows_support() -> WindowsSupport {
+        WindowsSupport::probe()
+    }
+
     /// Check if sandboxing is supported on this platform
     #[must_use]
     pub fn is_supported() -> bool {
@@ -205,7 +253,12 @@ impl Sandbox {
             macos::is_supported()
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(target_os = "windows")]
+        {
+            windows::is_supported()
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
             false
         }
@@ -224,7 +277,12 @@ impl Sandbox {
             macos::support_info()
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(target_os = "windows")]
+        {
+            windows::support_info()
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         {
             SupportInfo {
                 is_supported: false,

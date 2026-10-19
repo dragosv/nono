@@ -40,6 +40,17 @@ system-keyring = ["dep:keyring", "nono/system-keyring", "nono-proxy/system-keyri
 # Enables test-only trust root overrides used by the integration harness.
 test-trust-overrides = []
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [dependencies]
 nono = { version = "0.80.0", path = "../nono", default-features = false }
 nono-proxy = { version = "0.80.0", path = "../nono-proxy", default-features = false }

@@ -26,9 +26,14 @@
 //! - Peer authentication via `SO_PEERCRED` (Linux) / `LOCAL_PEERPID` (macOS)
 //! - Path comparison uses [`Path::starts_with()`], never string operations
 
+// The transport uses Unix domain sockets, SCM_RIGHTS and peer credentials,
+// none of which exist on Windows. The message types and approval trait stay
+// portable.
+#[cfg(unix)]
 pub mod socket;
 pub mod types;
 
+#[cfg(unix)]
 pub use socket::{SupervisorListener, SupervisorSocket};
 pub use types::{
     ApprovalDecision, ApprovalRequest, AuditEntry, CapabilityRequest, SupervisorMessage,

@@ -381,6 +381,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_unix_socket_state_roundtrip_preserves_original_and_resolved() {
         use tempfile::tempdir;

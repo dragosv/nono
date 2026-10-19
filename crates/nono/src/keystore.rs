@@ -1217,7 +1217,7 @@ thread_local! {
 /// Must not mutate process `PATH`: `test_load_secret_by_ref_dispatches_op`
 /// (and the `bw`/`security` dispatch tests) spawn those binaries by bare name
 /// against the process PATH, and would execute a trojan planted there.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[must_use]
 fn override_broker_path(path: String) -> TestBrokerPathGuard {
     TEST_BROKER_PATH.with(|slot| {
@@ -1226,10 +1226,10 @@ fn override_broker_path(path: String) -> TestBrokerPathGuard {
     TestBrokerPathGuard
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 struct TestBrokerPathGuard;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for TestBrokerPathGuard {
     fn drop(&mut self) {
         TEST_BROKER_PATH.with(|slot| {

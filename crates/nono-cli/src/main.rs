@@ -2,118 +2,220 @@
 //!
 //! This is the CLI binary that uses the nono library for OS-level sandboxing.
 
+#[cfg(unix)]
 mod app_runtime;
+#[cfg(unix)]
 mod approval_runtime;
+#[cfg(unix)]
 mod audit_attestation;
+#[cfg(unix)]
 mod audit_client;
+#[cfg(unix)]
 mod audit_commands;
+#[cfg(unix)]
 mod audit_event_reader;
+#[cfg(unix)]
 mod audit_integrity;
+#[cfg(unix)]
 mod audit_ledger;
+#[cfg(unix)]
 mod audit_session;
+#[cfg(unix)]
 mod capability_ext;
+#[cfg(unix)]
 mod cli;
+#[cfg(unix)]
 mod cli_bootstrap;
+#[cfg(unix)]
 mod command_blocking_deprecation;
+#[cfg(unix)]
 mod command_display;
+#[cfg(unix)]
 mod command_policy;
+#[cfg(unix)]
 mod command_runtime;
+#[cfg(unix)]
 mod completions;
+#[cfg(unix)]
 mod config;
 #[cfg(unix)]
 mod connect_client;
+#[cfg(unix)]
 mod credential_runtime;
+#[cfg(unix)]
 mod deprecation_warnings;
+#[cfg(unix)]
 mod diagnostic;
+#[cfg(unix)]
 mod exec_strategy;
+#[cfg(unix)]
 mod execution_runtime;
 #[cfg(unix)]
 mod hook_runtime;
+#[cfg(unix)]
 mod instruction_deny;
+#[cfg(unix)]
 mod jsonc;
+#[cfg(unix)]
 mod launch_runtime;
 #[cfg(target_os = "linux")]
 mod lineage_cgroup;
 #[cfg(target_os = "macos")]
 mod macos_trust;
+#[cfg(unix)]
 mod migration;
+#[cfg(unix)]
 mod network_policy;
+#[cfg(unix)]
 mod open_url_runtime;
+#[cfg(unix)]
 mod output;
+#[cfg(unix)]
 mod owned_children;
+#[cfg(unix)]
 mod pack_update_hint;
+#[cfg(unix)]
 mod package;
+#[cfg(unix)]
 mod package_cmd;
+#[cfg(unix)]
 mod package_status;
+#[cfg(unix)]
 mod platform;
+#[cfg(unix)]
 mod platform_client;
+#[cfg(unix)]
 mod policy;
+#[cfg(unix)]
 mod profile;
+#[cfg(unix)]
 mod profile_cmd;
+#[cfg(unix)]
 mod profile_runtime;
+#[cfg(unix)]
 mod profile_save_runtime;
+#[cfg(unix)]
 mod protected_paths;
+#[cfg(unix)]
 mod proxy_command;
+#[cfg(unix)]
 mod proxy_runtime;
+#[cfg(unix)]
 mod pty_proxy;
+#[cfg(unix)]
 mod pull_ui;
+#[cfg(unix)]
 mod query_ext;
+#[cfg(unix)]
 mod registry_client;
 #[cfg(unix)]
 mod remote_run;
 #[cfg(target_os = "linux")]
 mod resource_cgroup;
+#[cfg(unix)]
 mod rollback_commands;
+#[cfg(unix)]
 mod rollback_preflight;
+#[cfg(unix)]
 mod rollback_runtime;
+#[cfg(unix)]
 mod rollback_session;
+#[cfg(unix)]
 mod rollback_ui;
+#[cfg(unix)]
 mod sandbox_log;
+#[cfg(unix)]
 mod sandbox_prepare;
+#[cfg(unix)]
 mod sandbox_state;
+#[cfg(unix)]
 mod session;
+#[cfg(unix)]
 mod session_commands;
+#[cfg(unix)]
 mod setup;
+#[cfg(unix)]
 mod startup_prompt;
+#[cfg(unix)]
 mod startup_runtime;
+#[cfg(unix)]
 mod state_paths;
+#[cfg(unix)]
 mod supervised_runtime;
+#[cfg(unix)]
 mod temp_keepalive;
+#[cfg(unix)]
 mod terminal_approval;
+#[cfg(unix)]
 mod terminal_prompt;
+#[cfg(unix)]
 mod theme;
+#[cfg(unix)]
 mod timeouts;
+#[cfg(unix)]
 #[path = "tool-sandbox/mod.rs"]
 mod tool_sandbox;
+#[cfg(unix)]
 mod trust_cmd;
+#[cfg(unix)]
 mod trust_intercept;
+#[cfg(unix)]
 mod trust_keystore;
+#[cfg(unix)]
 mod trust_scan;
+#[cfg(unix)]
 mod update_check;
+#[cfg(unix)]
 mod url_open;
+#[cfg(unix)]
 mod why_runtime;
+#[cfg(unix)]
 mod wiring;
 
+#[cfg(unix)]
 #[cfg(test)]
 mod test_env;
 
+#[cfg(unix)]
 use app_runtime::run as run_cli;
+#[cfg(unix)]
 #[cfg(test)]
 use clap::Parser;
+#[cfg(unix)]
 use clap::{CommandFactory, FromArgMatches};
+#[cfg(unix)]
 use cli::Cli;
+#[cfg(unix)]
 use cli_bootstrap::{init_theme, init_tracing};
+#[cfg(unix)]
 use command_blocking_deprecation::{
     collect_cli_warnings, print_warnings as print_deprecation_warnings,
 };
+#[cfg(unix)]
 use nono::Result;
 
+#[cfg(unix)]
 const DETACHED_LAUNCH_ENV: &str = "NONO_DETACHED_LAUNCH";
+#[cfg(unix)]
 const DETACHED_CWD_PROMPT_RESPONSE_ENV: &str = "NONO_DETACHED_CWD_PROMPT_RESPONSE";
+#[cfg(unix)]
 const DETACHED_SESSION_ID_ENV: &str = "NONO_DETACHED_SESSION_ID";
 
+#[cfg(unix)]
 pub(crate) use launch_runtime::rollback_base_exclusions;
 
+// Native Windows: a separate front end over the library's PSEC launch backend.
+// The Unix modules above depend on fork/exec, Unix sockets and PTYs and are
+// not compiled there.
+#[cfg(windows)]
+mod windows;
+
+#[cfg(windows)]
+fn main() {
+    windows::main();
+}
+
+#[cfg(unix)]
 fn main() {
     if tool_sandbox::maybe_run_internal_tool_sandbox_entrypoint() {
         return;
@@ -157,6 +259,7 @@ fn main() {
     }
 }
 
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -910,8 +911,8 @@ impl SnapshotManager {
         Ok(FileState {
             hash,
             size: metadata.len(),
-            mtime: metadata.mtime(),
-            permissions: metadata.mode(),
+            mtime: metadata_mtime(&metadata),
+            permissions: metadata_mode(&metadata),
         })
     }
 
@@ -1031,9 +1032,40 @@ fn file_state_from_metadata(path: &Path) -> Result<FileState> {
     Ok(FileState {
         hash,
         size: metadata.len(),
-        mtime: metadata.mtime(),
-        permissions: metadata.mode(),
+        mtime: metadata_mtime(&metadata),
+        permissions: metadata_mode(&metadata),
     })
+}
+
+#[cfg(unix)]
+fn metadata_mtime(metadata: &fs::Metadata) -> i64 {
+    metadata.mtime()
+}
+
+#[cfg(unix)]
+fn metadata_mode(metadata: &fs::Metadata) -> u32 {
+    metadata.mode()
+}
+
+/// Seconds since the Unix epoch, matching `MetadataExt::mtime` on Unix.
+#[cfg(not(unix))]
+fn metadata_mtime(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Windows has no mode bits; derive a Unix-style mode from the read-only
+/// attribute so manifests stay comparable on one host.
+#[cfg(not(unix))]
+fn metadata_mode(metadata: &fs::Metadata) -> u32 {
+    if metadata.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    }
 }
 
 fn hash_file(path: &Path) -> Result<ContentHash> {
@@ -1939,6 +1971,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_to_large_file_not_counted_against_budget() {
         let (dir, tracked) = setup_test_dir();

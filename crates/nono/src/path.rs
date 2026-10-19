@@ -126,6 +126,7 @@ fn resolve_hops(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
 
     #[test]
@@ -153,6 +154,7 @@ mod tests {
         assert_eq!(result, canonical_dir.join("a").join("b").join("c"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn existing_symlink_resolves_through() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -781,6 +781,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_non_utf8_workdir_round_trips() {
         use std::os::unix::ffi::OsStrExt;
@@ -886,6 +887,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_trusted_host_pwd_accepts_a_spelling_of_the_launch_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -908,6 +910,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_trusted_host_pwd_rejects_untrustworthy_values() {
         use std::os::unix::ffi::OsStringExt;
