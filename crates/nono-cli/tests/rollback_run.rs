@@ -3,6 +3,11 @@
 //! Exercises the baseline-snapshot → modify → rollback → verify-restored flow
 //! using `nono run --rollback` and `nono rollback` subcommands.
 
+// Unix only: exercises rollback sessions,
+// which the Windows front end (src/windows/) does not implement.
+// Windows CLI coverage lives in windows_cli.rs.
+#![cfg(unix)]
+
 use nono_test_support::{Argv, NonoTest, Rollback, nono_test};
 use std::fs;
 use std::path::PathBuf;

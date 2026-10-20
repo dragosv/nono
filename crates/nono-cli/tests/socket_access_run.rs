@@ -6,6 +6,11 @@
 //! macOS: `filesystem.deny` on a socket path causes Seatbelt to emit both a
 //! filesystem deny and a `network-outbound` deny, blocking the connect.
 
+// Unix only: exercises AF_UNIX socket mediation,
+// which the Windows front end (src/windows/) does not implement.
+// Windows CLI coverage lives in windows_cli.rs.
+#![cfg(unix)]
+
 use nono_test_support::{Argv, nono_test};
 #[cfg(target_os = "linux")]
 use std::fs;

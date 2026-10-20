@@ -2,6 +2,11 @@
 //!
 //! These run as separate processes, so they are fully isolated from unit tests.
 
+// Unix only: exercises `nono profile`,
+// which the Windows front end (src/windows/) does not implement.
+// Windows CLI coverage lives in windows_cli.rs.
+#![cfg(unix)]
+
 use std::process::Command;
 
 fn nono_bin() -> Command {

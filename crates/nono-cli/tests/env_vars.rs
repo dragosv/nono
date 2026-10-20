@@ -3,6 +3,11 @@
 //! These run as separate processes via `--dry-run`, so env vars are isolated
 //! and cannot race with parallel unit tests.
 
+// Unix only: exercises `NONO_*` configuration variables and profiles,
+// which the Windows front end (src/windows/) does not implement.
+// Windows CLI coverage lives in windows_cli.rs.
+#![cfg(unix)]
+
 use std::process::Command;
 
 fn nono_bin() -> Command {

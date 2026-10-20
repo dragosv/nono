@@ -166,6 +166,48 @@ impl<'t, M: Sandboxing> Sandboxed<'t, M> {
         self
     }
 
+    /// `--read <PATH>`, repeatable.
+    pub fn read(mut self, path: impl AsRef<Path>) -> Self {
+        self.inner.opt("--read", path.as_ref());
+        self
+    }
+
+    /// `--write <PATH>`, repeatable.
+    pub fn write(mut self, path: impl AsRef<Path>) -> Self {
+        self.inner.opt("--write", path.as_ref());
+        self
+    }
+
+    /// `--allow-domain <DOMAIN>`, repeatable.
+    pub fn allow_domain(mut self, domain: &str) -> Self {
+        self.inner.opt("--allow-domain", domain);
+        self
+    }
+
+    /// `--allow-private-inbound` (Windows).
+    pub fn allow_private_inbound(mut self) -> Self {
+        self.inner.flag("--allow-private-inbound");
+        self
+    }
+
+    /// `--deny <PATH>` (Windows).
+    pub fn deny(mut self, path: impl AsRef<Path>) -> Self {
+        self.inner.opt("--deny", path.as_ref());
+        self
+    }
+
+    /// `--allow-win32k` (Windows).
+    pub fn allow_win32k(mut self) -> Self {
+        self.inner.flag("--allow-win32k");
+        self
+    }
+
+    /// `--enumerate-ancestors` (Windows).
+    pub fn enumerate_ancestors(mut self) -> Self {
+        self.inner.flag("--enumerate-ancestors");
+        self
+    }
+
     pub fn config(mut self, path: impl AsRef<Path>) -> Self {
         self.inner.opt("--config", path.as_ref());
         self
@@ -374,6 +416,10 @@ impl RollbackCleanup<'_> {
     pub fn output(self) -> Completed {
         self.inner.finish()
     }
+}
+
+pub(crate) fn raw(t: &NonoTest, args: &[&str]) -> Completed {
+    Invocation::new(t, args).finish()
 }
 
 /// Accumulates argv/env for one `nono` invocation.

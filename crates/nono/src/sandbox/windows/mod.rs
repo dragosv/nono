@@ -26,6 +26,7 @@
 mod psec_spec;
 
 mod launch;
+mod pin;
 mod policy;
 mod psec;
 mod spec;

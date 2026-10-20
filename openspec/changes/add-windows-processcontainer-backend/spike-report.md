@@ -367,11 +367,80 @@ accepted (groups 3+).
   are restored. The stdin relay thread owns its pipe handle, so it never
   writes to a closed handle.
 
+**CLI integration tests on Windows (2026-10-20):**
+- `crates/nono-cli/tests/windows_cli.rs` holds 18 end-to-end tests of the
+  Windows front end, run through the shared hermetic harness. Each denial
+  has a positive control. They cover rw, read-only, ungranted and deny
+  grants, `--write` refusal, exit codes, TEMP, `--block-net`,
+  `--allow-domain` filtering (403 for an unlisted host; a direct
+  `--noproxy` connection is refused), dry-run redaction, opt-in
+  enumeration, injection variables, win32k, command resolution, refusal of
+  unported flags, and the batch filter with a trailing dot.
+- The 12 test files that drive unported Unix CLI features (profiles, trust,
+  audit, rollback, `wrap`, `--config`, `NONO_*`, globs, AF_UNIX, the
+  supervisor socket) are `#![cfg(unix)]` and give the reason in a comment.
+  The lint tests find Git for Windows' bash
+  (`nono_test_support::bash`). `cargo test -p nono-cli --tests` passes on
+  Windows.
+- **PSEC sets TEMP/TMP** to the container's own temp folder
+  (`%LOCALAPPDATA%\Packages\sandbox.{guid}\AC\Temp`). It is distinct per
+  run and deleted when the run ends. The CLI therefore no longer creates or
+  grants a temp directory of its own; that grant had no effect.
+- **A batch file started directly fails** under PSEC with "Access is
+  denied." `cmd /c call x.bat` works.
+- **`cmd`'s `dir` needs ancestor enumeration** even inside a read-write
+  grant. PowerShell's `Get-ChildItem` lists the same directory without it.
+
+**Second review (2026-10-20), checked on build 26300:**
+- **Verbatim names Windows rewrites: confirmed and fixed.** Granting
+  `\\?\...\safe.` emitted `...\safe.` and opened the sibling `safe` (its
+  secret was readable). Policy paths, the program and the working directory
+  now refuse components ending in a dot or space, DOS device names (`NUL`,
+  `COM1`, `nul.txt`, `COM¹`) and wildcard characters. Covered by unit,
+  enforcement and CLI tests.
+- **File grant turned into a directory or junction: fixed.** PSEC resolves
+  paths when the environment is created. Every grant, deny and enumerate
+  path is now opened before that, checked (final path; file or directory
+  kind for grants) and held without `FILE_SHARE_DELETE`. Once the process
+  exists, still suspended, each path is resolved again and must name the
+  same file ID. Inside the sandbox, a read-only file grant in a read-write
+  tree cannot be deleted, and `mklink /J` is refused.
+- **UI limits and nested jobs.** The interactive path worked with the limits
+  set before assignment: exit 7 reached the caller, the marker file was
+  written, and the clipboard was denied. The documented contract forbids
+  assigning a process that is already in a job to a job with UI limits, so
+  the limits are now applied after assignment, while the process is still
+  suspended. Clipboard denial was re-verified in both modes, and an automated
+  interactive test (`CREATE_NEW_CONSOLE`) covers the shim path.
+- **Proxy-only and private-network inbound.** PSEC refuses the proxy form
+  with an ingress table, and without `privateNetworkClientServer`
+  (`E_INVALIDARG`), so inbound traffic from private networks cannot be ruled
+  out. On this host, inbound to a listener in the container was refused
+  from loopback and from the host's own LAN address. That address counts as
+  loopback, though, and the network profile is Public, so this says
+  nothing about a second machine on a private network. Proxy-only is
+  therefore refused unless the caller accepts it
+  (`LaunchOptions::allow_private_network_inbound`, CLI
+  `--allow-private-inbound`), and the rendered policy states it. A test from
+  a second machine on a Private network is still open.
+- **Allow-all is internet only.** Host loopback and private networks are
+  refused under `internetClient` alone. Opening them takes
+  `privateNetworkClientServer` plus `networkLoopback` with ingress allowed,
+  which also admits inbound traffic (verified: host → container connected).
+  nono keeps the narrower mapping and now says so in the rendered policy and
+  the help.
+- **Implicit access** (files and registry readable by ALL APPLICATION
+  PACKAGES, and the container's TEMP) is listed in `RenderedPolicy::implicit`
+  and in `--dry-run`.
+- **Batch script paths** containing characters cmd.exe expands (`%`, `!`,
+  `^`, `&`) are refused. Arguments were already filtered.
+- Experiment driver: `spikes/windows-psec-direct/src/bin/netprobe.rs`.
+
 **Open:**
 - 13 pre-existing `nono` unit tests fail on Windows. They assume Unix PATH
   separators, file permissions or Unix sockets, and none touch the backend.
-- The `nono-cli` integration tests are Unix-only and do not compile on
-  Windows.
+- The Unix CLI integration tests run only on Unix until the matching
+  features are ported (profiles, trust, audit, rollback, supervisor).
 - Profiles, default protected paths, the `WriteConsoleInput` probe, an
   automated resize and Ctrl-C test, the non-PSEC refusal (1.2) and the WFP
   check after abort (1.8) are not done.

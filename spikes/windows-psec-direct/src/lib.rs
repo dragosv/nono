@@ -150,6 +150,21 @@ pub enum Net {
     AllowAll,
     /// PSEC proxy mode: only the given loopback proxy URL is reachable.
     Proxy(String),
+    /// Spike-only: an arbitrary network shape, for the review experiments.
+    Custom(CustomNet),
+}
+
+/// A raw network shape: capabilities plus the optional egress, ingress and
+/// proxy tables, emitted as given.
+#[derive(Default, Clone)]
+pub struct CustomNet {
+    pub capabilities: Vec<String>,
+    /// `Some(true)` = egress default allow, `Some(false)` = deny.
+    pub egress_allow: Option<bool>,
+    /// `(default allow, host loopback allow)`.
+    pub ingress: Option<(bool, bool)>,
+    pub proxy: Option<String>,
+    pub peer: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -193,6 +208,18 @@ pub fn build_spec(policy: &Policy, minor: u16) -> Vec<u8> {
             caps.push("networkLoopback");
             network.proxy = Some(Box::new(layout::ProxyInfoT { url: Some(url.clone()) }));
             network.allowed_appcontainer_peer = Some("MXC-Loopback".to_string());
+        }
+        Net::Custom(custom) => {
+            let action = |allow: bool| if allow { layout::FilterAction::allow } else { layout::FilterAction::deny };
+            caps.extend(custom.capabilities.iter().map(String::as_str));
+            network.egress = custom
+                .egress_allow
+                .map(|allow| Box::new(layout::EndpointPolicyT { default_action: action(allow), ..Default::default() }));
+            network.ingress = custom.ingress.map(|(default, loopback)| {
+                Box::new(layout::IngressPolicyT { default_action: action(default), host_loopback: action(loopback) })
+            });
+            network.proxy = custom.proxy.clone().map(|url| Box::new(layout::ProxyInfoT { url: Some(url) }));
+            network.allowed_appcontainer_peer = custom.peer.clone();
         }
     }
     let spec = layout::ProcessSecurityEnvironmentT {

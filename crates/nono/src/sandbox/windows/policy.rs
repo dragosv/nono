@@ -137,6 +137,16 @@ impl WindowsPolicy {
                 if *port == 0 {
                     return Err(unsupported("proxy port 0 is not valid".to_string()));
                 }
+                // PSEC's proxy form needs privateNetworkClientServer, a
+                // bidirectional capability, and refuses an ingress table
+                // next to it (E_INVALIDARG on build 26300). Inbound traffic
+                // from private networks therefore cannot be ruled out.
+                if !opts.private_inbound_allowed() {
+                    return Err(unsupported(
+                        "proxy-only networking on Windows also admits inbound connections from private networks (privateNetworkClientServer is bidirectional and cannot be narrowed); the caller must accept this explicitly"
+                            .to_string(),
+                    ));
+                }
                 Network::Proxy { port: *port }
             }
         };
@@ -168,9 +178,19 @@ impl WindowsPolicy {
             },
             win32k_allowed: self.allow_win32k,
             memory_bytes: self.memory_bytes,
+            implicit: IMPLICIT_ACCESS.iter().map(|s| (*s).to_string()).collect(),
         }
     }
 }
+
+/// Access every PSEC workload has without a grant (spike §1.2: reading
+/// `C:\Windows\win.ini` and listing `System32` succeed; listing `C:\Users`
+/// does not). Exact coverage depends on the host's ACLs.
+const IMPLICIT_ACCESS: [&str; 3] = [
+    "read: files and directories whose ACL grants ALL APPLICATION PACKAGES (by default most of %SystemRoot% and %ProgramFiles%; host-dependent)",
+    "read: registry keys readable by ALL APPLICATION PACKAGES",
+    "read-write: the container's own TEMP folder (per run, removed when the run ends)",
+];
 
 fn unsupported(reason: String) -> NonoError {
     NonoError::SandboxInit(reason)
@@ -288,6 +308,9 @@ pub(crate) fn policy_path(path: &Path, usage: PathUse) -> Result<String> {
                 if name.contains(':') {
                     return reject("alternate data streams are not supported");
                 }
+                if let Some(why) = win32_name_problem(name) {
+                    return reject(why);
+                }
                 if depth > 0 {
                     out.push('\\');
                 }
@@ -304,6 +327,43 @@ pub(crate) fn policy_path(path: &Path, usage: PathUse) -> Result<String> {
         return reject("volume roots cannot be granted or denied");
     }
     Ok(out)
+}
+
+/// Why a path component would name a different object once the `\\?\`
+/// prefix is removed, or `None` if it is safe.
+///
+/// PSEC and Win32 normalise plain paths: trailing dots and spaces are
+/// dropped and DOS device names refer to devices. A verbatim path can name a
+/// directory `safe.` that is distinct from `safe`; stripping the prefix
+/// would silently retarget a grant, a deny or the working directory.
+pub(crate) fn win32_name_problem(name: &str) -> Option<&'static str> {
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("a name ending in a dot or space is rewritten by Windows");
+    }
+    if name
+        .chars()
+        .any(|c| c < ' ' || matches!(c, '<' | '>' | '"' | '|' | '?' | '*' | '/'))
+    {
+        return Some("the name contains characters Windows treats specially");
+    }
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    let device = |prefix: &str| {
+        stem.chars().count() == prefix.len() + 1
+            && stem.is_char_boundary(prefix.len())
+            && stem[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && stem[prefix.len()..]
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '¹' | '²' | '³'))
+    };
+    let reserved = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|d| stem.eq_ignore_ascii_case(d))
+        || device("COM")
+        || device("LPT");
+    if reserved {
+        return Some("the name is a DOS device name");
+    }
+    None
 }
 
 /// The policy a launch will apply, in display form.
@@ -333,6 +393,8 @@ pub struct RenderedPolicy {
     /// Committed-memory cap for the whole process tree, in bytes. Allocations
     /// beyond it fail; the tree is not killed.
     pub memory_bytes: Option<u64>,
+    /// Access Windows gives every PSEC workload without a grant.
+    pub implicit: Vec<String>,
 }
 
 /// Network policy in display form.
@@ -340,10 +402,13 @@ pub struct RenderedPolicy {
 pub enum RenderedNetwork {
     /// All network access is refused, including system resolver lookups.
     Blocked,
-    /// Network access is unrestricted.
+    /// Outbound internet access. Host loopback and private networks stay
+    /// blocked: opening them needs bidirectional capabilities that would
+    /// also admit inbound connections.
     AllowAll,
     /// Only the local proxy is reachable. System resolver lookups remain
-    /// available.
+    /// available, and Windows admits inbound connections from private
+    /// networks (the proxy form requires `privateNetworkClientServer`).
     ProxyOnly {
         /// Proxy port on 127.0.0.1.
         port: u16,
@@ -376,11 +441,17 @@ impl fmt::Display for RenderedPolicy {
             RenderedNetwork::Blocked => {
                 writeln!(f, "network:   blocked (system resolver blocked)")?
             }
-            RenderedNetwork::AllowAll => writeln!(f, "network:   allowed")?,
+            RenderedNetwork::AllowAll => writeln!(
+                f,
+                "network:   internet only (host loopback and private networks blocked)"
+            )?,
             RenderedNetwork::ProxyOnly { port } => writeln!(
                 f,
-                "network:   proxy-only via http://127.0.0.1:{port} (system resolver reachable)"
+                "network:   proxy-only via http://127.0.0.1:{port} (system resolver reachable; inbound from private networks admitted)"
             )?,
+        }
+        for line in &self.implicit {
+            writeln!(f, "implicit:  {line}")?;
         }
         if let Some(bytes) = self.memory_bytes {
             writeln!(
@@ -431,6 +502,44 @@ mod tests {
             assert!(
                 policy_path(Path::new(bad), PathUse::Grant).is_err(),
                 "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn names_windows_would_rewrite_are_rejected() {
+        // Observed on build 26300: a grant on \\?\...\safe. emitted as
+        // ...\safe. also opened the sibling ...\safe.
+        for bad in [
+            r"\\?\C:\proj\safe.",
+            r"\\?\C:\proj\safe ",
+            r"\\?\C:\proj\safe. .",
+            r"\\?\C:\proj\NUL",
+            r"\\?\C:\proj\nul.txt",
+            r"\\?\C:\proj\COM1",
+            r"\\?\C:\proj\lpt9.log",
+            r"\\?\C:\proj\COM¹",
+            r"\\?\C:\proj\CONOUT$",
+            r"\\?\C:\proj\a*b",
+            r"\\?\C:\proj\a?b",
+        ] {
+            for usage in [PathUse::Grant, PathUse::Deny, PathUse::Enumerate] {
+                assert!(
+                    policy_path(Path::new(bad), usage).is_err(),
+                    "{bad} must be rejected for {usage:?}"
+                );
+            }
+        }
+        for good in [
+            r"\\?\C:\proj\.git",
+            r"\\?\C:\proj\v1.2",
+            r"\\?\C:\proj\console",
+            r"\\?\C:\proj\COM10",
+            r"\\?\C:\proj\nullable",
+        ] {
+            assert!(
+                policy_path(Path::new(good), PathUse::Grant).is_ok(),
+                "{good} must be accepted"
             );
         }
     }
@@ -507,6 +616,46 @@ mod tests {
         let opts = LaunchOptions::new(r"C:\Windows\System32\whoami.exe", r"C:\");
         let policy = WindowsPolicy::from_launch(&caps, &opts, None)?;
         assert_eq!(policy.network, Network::Blocked);
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_only_requires_accepting_private_inbound() -> Result<()> {
+        let caps = CapabilitySet::new().proxy_only(3128);
+        let opts = LaunchOptions::new(r"C:\Windows\System32\whoami.exe", r"C:\");
+        let err = WindowsPolicy::from_launch(&caps, &opts, None)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("private networks"), "{err}");
+
+        let opts = opts.allow_private_network_inbound(true);
+        let policy = WindowsPolicy::from_launch(&caps, &opts, None)?;
+        assert_eq!(policy.network, Network::Proxy { port: 3128 });
+        let shown = policy.render(None).to_string();
+        assert!(
+            shown.contains("inbound from private networks admitted"),
+            "{shown}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rendering_is_honest_about_allow_all_and_implicit_access() -> Result<()> {
+        let opts = LaunchOptions::new(r"C:\Windows\System32\whoami.exe", r"C:\");
+        let shown = WindowsPolicy::from_launch(&CapabilitySet::new(), &opts, None)?
+            .render(None)
+            .to_string();
+        assert!(
+            shown.contains("internet only (host loopback and private networks blocked)"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(
+                "implicit:  read: files and directories whose ACL grants ALL APPLICATION PACKAGES"
+            ),
+            "{shown}"
+        );
         Ok(())
     }
 

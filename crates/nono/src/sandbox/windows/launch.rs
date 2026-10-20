@@ -44,7 +44,8 @@ use crate::capability::CapabilitySet;
 use crate::error::{NonoError, Result};
 use crate::resource::ResourceLimits;
 
-use super::policy::WindowsPolicy;
+use super::pin::Pins;
+use super::policy::{PathUse, WindowsPolicy, policy_path};
 use super::psec::{self, Environment, SCHEMA_MAJOR};
 use super::{last_error, spec};
 
@@ -91,6 +92,7 @@ pub struct LaunchOptions {
     deny_paths: Vec<PathBuf>,
     enumerate_paths: Vec<PathBuf>,
     allow_win32k: bool,
+    allow_private_inbound: bool,
     stdio: LaunchStdio,
 }
 
@@ -105,6 +107,7 @@ impl std::fmt::Debug for LaunchOptions {
             .field("deny_paths", &self.deny_paths)
             .field("enumerate_paths", &self.enumerate_paths)
             .field("allow_win32k", &self.allow_win32k)
+            .field("allow_private_inbound", &self.allow_private_inbound)
             .field("stdio", &self.stdio)
             .finish()
     }
@@ -122,6 +125,7 @@ impl LaunchOptions {
             deny_paths: Vec::new(),
             enumerate_paths: Vec::new(),
             allow_win32k: false,
+            allow_private_inbound: false,
             stdio: LaunchStdio::Null,
         }
     }
@@ -180,6 +184,17 @@ impl LaunchOptions {
         self
     }
 
+    /// Accept that proxy-only networking admits inbound connections from
+    /// private networks. Off by default, and proxy-only launches are refused
+    /// without it: PSEC's proxy form needs `privateNetworkClientServer`,
+    /// which is bidirectional, and refuses an ingress table that would
+    /// narrow it.
+    #[must_use]
+    pub fn allow_private_network_inbound(mut self, allow: bool) -> Self {
+        self.allow_private_inbound = allow;
+        self
+    }
+
     /// Standard I/O mode.
     #[must_use]
     pub fn stdio(mut self, stdio: LaunchStdio) -> Self {
@@ -197,6 +212,10 @@ impl LaunchOptions {
 
     pub(crate) fn win32k_allowed(&self) -> bool {
         self.allow_win32k
+    }
+
+    pub(crate) fn private_inbound_allowed(&self) -> bool {
+        self.allow_private_inbound
     }
 }
 
@@ -304,6 +323,9 @@ impl Drop for SandboxedChild {
 pub(crate) fn render(caps: &CapabilitySet, opts: &LaunchOptions) -> Result<super::RenderedPolicy> {
     let host = host_info().ok();
     let policy = WindowsPolicy::from_launch(caps, opts, host)?;
+    // The same path checks a launch makes (kind, final path), released at
+    // once.
+    drop(Pins::acquire(caps, &policy)?);
     Ok(policy.render(host.map(|(minor, _)| minor)))
 }
 
@@ -331,12 +353,15 @@ pub(crate) fn launch(caps: &CapabilitySet, opts: &LaunchOptions) -> Result<Sandb
             opts.program.display()
         )));
     }
-    let program = strip_verbatim(&opts.program);
+    let program = plain_path(&opts.program)?;
     let application = wide_path(&program, "program")?;
     let mut command_line = command_line(&program, &opts.args)?;
-    let cwd = wide_path(&strip_verbatim(&opts.cwd), "working directory")?;
+    let cwd = wide_path(&plain_path(&opts.cwd)?, "working directory")?;
     let env_block = env_block(&opts.env)?;
 
+    // Held until the process exists: no policy path can be swapped while PSEC
+    // resolves it.
+    let pins = Pins::acquire(caps, &policy)?;
     let environment = api.create(&spec::build(&policy, minor))?;
     let job = create_job(caps.resource_limits())?;
     let mut stdio = Stdio::new(opts.stdio)?;
@@ -445,6 +470,16 @@ pub(crate) fn launch(caps: &CapabilitySet, opts: &LaunchOptions) -> Result<Sandb
         unsafe { TerminateProcess(process.as_raw_handle(), 1) };
         return Err(error);
     }
+    // UI limits go on after the assignment: a process that is already in a
+    // job (the console shim's, or a caller's) may not be assigned to a job
+    // that has them. The process is still suspended. Then every policy path
+    // must still name the object that was pinned.
+    if let Err(error) = restrict_ui(&job).and_then(|()| pins.verify()) {
+        // SAFETY: live job handle; ends the suspended process.
+        unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
+        return Err(error);
+    }
+    drop(pins);
     // SAFETY: live handle to the suspended primary thread.
     if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
         let error = win32_error("ResumeThread");
@@ -470,7 +505,7 @@ fn win32_error(what: &str) -> NonoError {
     NonoError::SandboxInit(format!("{what} failed: Win32 error {}", last_error()))
 }
 
-fn owned(handle: HANDLE, what: &str) -> Result<OwnedHandle> {
+pub(crate) fn owned(handle: HANDLE, what: &str) -> Result<OwnedHandle> {
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return Err(win32_error(what));
     }
@@ -513,9 +548,13 @@ fn create_job(limits: Option<&ResourceLimits>) -> Result<OwnedHandle> {
     {
         return Err(win32_error("SetInformationJobObject"));
     }
-    // PSEC confines win32k only by turning it off. When it is allowed, these
-    // keep the workload away from the clipboard, global atoms, other
-    // processes' windows and desktop or system settings.
+    Ok(job)
+}
+
+/// PSEC confines win32k only by turning it off. When it is allowed, these
+/// keep the workload away from the clipboard, global atoms, other processes'
+/// windows and desktop or system settings.
+fn restrict_ui(job: &OwnedHandle) -> Result<()> {
     let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
         UIRestrictionsClass: UI_RESTRICTIONS,
     };
@@ -532,7 +571,7 @@ fn create_job(limits: Option<&ResourceLimits>) -> Result<OwnedHandle> {
     {
         return Err(win32_error("SetInformationJobObject(UI restrictions)"));
     }
-    Ok(job)
+    Ok(())
 }
 
 /// Every job UI limit.
@@ -695,23 +734,14 @@ fn open_null() -> Result<OwnedHandle> {
     owned(handle, "CreateFileW(NUL)")
 }
 
-/// `\\?\X:\rest` → `X:\rest`. Canonical paths come back in verbatim form,
-/// which `cmd.exe` and other programs treat as UNC when used as the working
-/// directory or argv[0]. Other forms are returned unchanged.
-fn strip_verbatim(path: &Path) -> PathBuf {
-    use std::path::{Component, Prefix};
-    let mut components = path.components();
-    match components.next() {
-        Some(Component::Prefix(prefix)) => match prefix.kind() {
-            Prefix::VerbatimDisk(drive) => {
-                let mut plain = PathBuf::from(format!("{}:\\", char::from(drive)));
-                plain.extend(components.filter(|c| !matches!(c, Component::RootDir)));
-                plain
-            }
-            _ => path.to_path_buf(),
-        },
-        _ => path.to_path_buf(),
-    }
+/// `\\?\X:\rest` → `X:\rest`, for the program and working directory.
+/// Canonical paths come back in verbatim form, which `cmd.exe` and other
+/// programs treat as UNC when used as the working directory or argv[0].
+///
+/// Validated like a policy path: a component Windows would rewrite once the
+/// prefix is gone (`dir.`, `NUL`) is refused, as are UNC and device paths.
+fn plain_path(path: &Path) -> Result<PathBuf> {
+    policy_path(path, PathUse::Enumerate).map(PathBuf::from)
 }
 
 fn wide_path(path: &Path, what: &str) -> Result<Vec<u16>> {
@@ -761,6 +791,14 @@ pub(crate) fn command_line(program: &Path, args: &[OsString]) -> Result<Vec<u16>
         .extension()
         .and_then(OsStr::to_str)
         .is_some_and(|e| e.eq_ignore_ascii_case("bat") || e.eq_ignore_ascii_case("cmd"));
+    // cmd.exe expands %VAR% and, with delayed expansion, !VAR! even inside
+    // the quoted script path, so the path itself is held to a safe set.
+    if is_batch && !batch_safe_path(program) {
+        return Err(NonoError::SandboxInit(format!(
+            "batch file path contains characters cmd.exe would expand or interpret: {}",
+            program.display()
+        )));
+    }
 
     // argv[0] is parsed without escape processing: quote it verbatim.
     let mut line = Vec::with_capacity(program_wide.len().saturating_add(2));
@@ -795,6 +833,33 @@ fn batch_safe(arg: &OsStr) -> bool {
                 || matches!(
                     c,
                     ' ' | '-' | '_' | '.' | ',' | '/' | '\\' | ':' | '=' | '+' | '@' | '~' | '#'
+                )
+        })
+    })
+}
+
+fn batch_safe_path(path: &Path) -> bool {
+    path.to_str().is_some_and(|s| {
+        s.chars().all(|c| {
+            c.is_alphanumeric()
+                || matches!(
+                    c,
+                    ' ' | '\\'
+                        | ':'
+                        | '.'
+                        | '-'
+                        | '_'
+                        | ','
+                        | '+'
+                        | '@'
+                        | '~'
+                        | '#'
+                        | '='
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '\''
                 )
         })
     })
@@ -923,17 +988,23 @@ mod tests {
     }
 
     #[test]
-    fn strip_verbatim_only_touches_drive_paths() {
+    fn plain_path_strips_verbatim_and_refuses_rewritten_names() -> Result<()> {
         assert_eq!(
-            strip_verbatim(Path::new(r"\\?\C:\a\b")),
+            plain_path(Path::new(r"\\?\C:\a\b"))?,
             PathBuf::from(r"C:\a\b")
         );
-        assert_eq!(strip_verbatim(Path::new(r"\\?\C:\")), PathBuf::from(r"C:\"));
-        assert_eq!(strip_verbatim(Path::new(r"D:\x")), PathBuf::from(r"D:\x"));
-        assert_eq!(
-            strip_verbatim(Path::new(r"\\?\UNC\s\share")),
-            PathBuf::from(r"\\?\UNC\s\share")
-        );
+        assert_eq!(plain_path(Path::new(r"\\?\C:\"))?, PathBuf::from(r"C:\"));
+        assert_eq!(plain_path(Path::new(r"D:\x"))?, PathBuf::from(r"D:\x"));
+        for bad in [
+            r"\\?\UNC\s\share",
+            r"\\?\C:\work.",
+            r"\\?\C:\work \x",
+            r"\\?\C:\a\NUL",
+            r"\\?\C:\a\run.bat.",
+        ] {
+            assert!(plain_path(Path::new(bad)).is_err(), "{bad}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -972,6 +1043,22 @@ mod tests {
             assert!(line(program, &["a&calc"]).is_err(), "{program:?}");
         }
         assert!(line(r"C:\x.y\run.exe", &["a&b"]).is_ok());
+    }
+
+    #[test]
+    fn batch_paths_that_cmd_would_expand_are_rejected() {
+        for program in [
+            r"C:\x\%USERPROFILE%\run.bat",
+            r"C:\x\!PATH!\run.cmd",
+            r"C:\x\a^b\run.bat",
+            r"C:\x\a&b\run.bat",
+        ] {
+            assert!(line(program, &["ok"]).is_err(), "{program}");
+        }
+        assert!(line(r"C:\Program Files (x86)\Tool\run.bat", &["ok"]).is_ok());
+        assert!(line(r"C:\Users\José\run.cmd", &["ok"]).is_ok());
+        // Not a batch file: cmd.exe never parses this command line.
+        assert!(line(r"C:\x\100%\tool.exe", &["ok"]).is_ok());
     }
 
     #[test]

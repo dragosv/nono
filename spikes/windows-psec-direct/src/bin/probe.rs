@@ -81,6 +81,20 @@ fn op(name: &str, arg: &str) -> Result<String, String> {
             }
             Err("no connection".into())
         }
+        "listenall" => {
+            // listenall <port>: accept one connection within 8 s on 0.0.0.0.
+            let l = std::net::TcpListener::bind(("0.0.0.0", arg.parse::<u16>().map_err(|e| format!("{e}"))?))
+                .map_err(|e| format!("bind: {e}"))?;
+            println!("listening-all {arg}");
+            l.set_nonblocking(true).ok();
+            for _ in 0..80 {
+                if let Ok((_, peer)) = l.accept() {
+                    return Ok(format!("accepted from {peer}"));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err("no connection".into())
+        }
         "env" => std::env::var(arg).map(|v| format!("set ({} chars)", v.len())).map_err(|e| e.to_string()),
         "sleep" => {
             let secs: u64 = arg.parse().map_err(|e| format!("{e}"))?;

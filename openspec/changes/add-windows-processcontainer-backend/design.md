@@ -171,9 +171,9 @@ enumerate, `0x8` ingress).
 | `FsCapability{access: Write}` | launch error. The PSEC schema has no write-only mode (spike §1.9), and the grant is never widened to read-write |
 | `LaunchOptions.deny_paths` | native deny path; launch error if the host lacks it |
 | `NetworkMode::Blocked` | deny all egress (v4/v6, TCP/UDP) |
-| `NetworkMode::ProxyOnly{port, bind_ports: []}` | egress only to `127.0.0.1:port` / `[::1]:port` |
+| `NetworkMode::ProxyOnly{port, bind_ports: []}` | egress only to `127.0.0.1:port` / `[::1]:port`. Refused unless the caller accepts private-network inbound (`LaunchOptions::allow_private_network_inbound`), because the proxy form requires the bidirectional `privateNetworkClientServer` and PSEC refuses an ingress table next to it |
 | `ProxyOnly{bind_ports: non-empty}`, `tcp_*_ports`, `localhost_port(s/ranges)` | launch error |
-| `NetworkMode::AllowAll` | no network restriction |
+| `NetworkMode::AllowAll` | outbound internet only (`internetClient`). Host loopback and private networks stay blocked: opening them needs capabilities that also admit inbound traffic. Narrower than requested, and rendered as such |
 | `unix_sockets`, non-default `signal_mode` / `process_info_mode` / `ipc_mode`, `platform_rules`, `extensions_enabled` | launch error naming the field |
 | `allowed_commands` / `blocked_commands` | CLI-level as today, not backend-enforced |
 
@@ -232,6 +232,12 @@ the PSEC proxy form only:
 - capabilities `privateNetworkClientServer,networkLoopback`
 - `allowed_appcontainer_peer = "MXC-Loopback"` (identity-less loopback proxy)
 
+Windows has no client-only private-network capability. `privateNetworkClientServer`
+also admits inbound traffic from private networks, and PSEC rejects an
+ingress table or a proxy form without that capability (`E_INVALIDARG`, second
+review). Proxy-only launches therefore need explicit acceptance from the
+caller, and the rendered policy states the exposure.
+
 Spike §1.6 and §1.11 showed that this is the only form that scopes loopback
 egress to a single endpoint. Host-loopback allow without a proxy URL opens
 every host loopback port, and egress allow rules do not narrow it. That
@@ -274,8 +280,11 @@ inheritance.
   with Win32 error 203 unless `SYSTEMROOT` and `LOCALAPPDATA` are present.
   Only their presence is checked. The CLI always supplies both. The library
   validates this and returns an error naming the missing variables.
-- **Temp directory.** The CLI creates a per-run temp directory, grants it
-  read-write, and sets `TEMP`/`TMP`.
+- **Temp directory.** PSEC sets `TEMP`/`TMP` to the container's own temp
+  folder (`%LOCALAPPDATA%\Packages\sandbox.{guid}\AC\Temp`), which is
+  distinct per run and deleted when the run ends. The CLI adds no temp
+  directory of its own; the rendered policy lists the folder under
+  implicit access.
 - **win32k.** `disallow_win32k_system_calls = true` makes every
   user32-loading binary fail with `0xC0000142`, including `cmd.exe` under a
   console and `mode.com`. The library exposes this as an explicit launch
@@ -299,7 +308,18 @@ inheritance.
 - **Verbatim paths.** Canonical paths come back as `\\?\X:\...`. `cmd.exe`
   treats such a working directory as UNC and falls back to `C:\Windows`.
   The library converts the program path and working directory to `X:\...`
-  before `CreateProcessW`.
+  before `CreateProcessW`. A component that Windows would rewrite once the
+  prefix is gone (trailing dot or space, DOS device name) is refused. A
+  grant on `\\?\...\safe.` emitted as `...\safe.` opened the sibling `safe`.
+- **Path pinning.** PSEC resolves policy paths when the environment is
+  created. Every grant, deny and enumerate path is opened beforehand,
+  checked (final path; file or directory kind for grants) and held without
+  `FILE_SHARE_DELETE`. After `CreateProcessW`, with the process still
+  suspended, each path must still resolve to the same file ID.
+- **Implicit access.** The rendered policy lists what Windows grants every
+  PSEC workload: objects readable by ALL APPLICATION PACKAGES (most of
+  `%SystemRoot%` and `%ProgramFiles%`, plus registry keys), and the
+  container's TEMP folder.
 
 ### D11. Unix-only library code is gated, not ported
 `supervisor::socket` and its re-exports (`SupervisorListener`,

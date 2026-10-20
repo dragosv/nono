@@ -9,7 +9,6 @@
 //! Pairs with `tests/alias_inventory.rs` (which gates `/// ALIAS` markers).
 
 use std::path::PathBuf;
-use std::process::Command;
 
 fn repo_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -30,7 +29,7 @@ fn lint_docs_script_passes() {
         script.display()
     );
 
-    let output = Command::new("bash")
+    let output = nono_test_support::bash()
         .arg(&script)
         .current_dir(&root)
         .output()

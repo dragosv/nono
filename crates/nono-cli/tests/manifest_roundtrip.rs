@@ -7,6 +7,11 @@
 //! 4. Manifest grants are deduplicated and `override_deny` paths are excluded
 //! 5. Property-based: randomly generated profiles round-trip through manifests
 
+// Unix only: exercises `nono profile` manifest export,
+// which the Windows front end (src/windows/) does not implement.
+// Windows CLI coverage lives in windows_cli.rs.
+#![cfg(unix)]
+
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;

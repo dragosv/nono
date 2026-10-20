@@ -105,6 +105,11 @@ impl NonoTest {
         cli::RollbackCmd::new(self)
     }
 
+    /// `nono <args…>` for subcommands without a typed builder.
+    pub fn raw(&self, args: &[&str]) -> Completed {
+        cli::raw(self, args)
+    }
+
     /// A `nono` invocation with a hermetic environment and no arguments.
     fn hermetic_command(&self) -> Command {
         let mut cmd = Command::new(&self.bin);
@@ -139,6 +144,35 @@ impl NonoTest {
     pub fn audit_root(&self) -> PathBuf {
         self.state.join("nono").join("audit")
     }
+}
+
+/// `bash`, for tests that run the repository's shell scripts.
+///
+/// On Windows this is Git for Windows' bash, found next to `git` on `PATH`,
+/// never `System32\bash.exe` (the WSL launcher, a different system). Falls
+/// back to `bash` on `PATH`.
+pub fn bash() -> Command {
+    #[cfg(windows)]
+    if let Some(bash) = git_bash() {
+        return Command::new(bash);
+    }
+    Command::new("bash")
+}
+
+/// `<git>\bin\bash.exe` for a `git.exe` on `PATH` under `<git>\cmd`,
+/// `<git>\bin` or `<git>\mingw64\bin`.
+#[cfg(windows)]
+fn git_bash() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        if !dir.join("git.exe").is_file() {
+            return None;
+        }
+        dir.ancestors()
+            .take(3)
+            .map(|root| root.join("bin").join("bash.exe"))
+            .find(|bash| bash.is_file())
+    })
 }
 
 fn is_scrubbable(key: &OsStr) -> bool {

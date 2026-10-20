@@ -77,7 +77,9 @@ pub(crate) struct RunArgs {
     /// Block all network access, including system DNS lookups
     #[arg(long = "block-net", conflicts_with_all = ["allow_net", "allow_domain", "deny_domain"], help_heading = "NETWORK")]
     pub(crate) block_net: bool,
-    /// Deprecated compatibility flag. Network is unrestricted by default.
+    /// Deprecated compatibility flag. On Windows the default network is
+    /// outbound internet only; host loopback and private networks stay
+    /// blocked.
     #[arg(long = "allow-net", hide = true, help_heading = "NETWORK")]
     pub(crate) allow_net: bool,
     /// Route traffic through nono's filtering proxy and allow this domain
@@ -93,6 +95,11 @@ pub(crate) struct RunArgs {
         help_heading = "NETWORK"
     )]
     pub(crate) deny_domain: Vec<String>,
+    /// Accept that proxy mode (--allow-domain/--deny-domain) also admits
+    /// inbound connections from private networks: Windows only offers a
+    /// bidirectional private-network capability for it (Windows)
+    #[arg(long, help_heading = "NETWORK")]
+    pub(crate) allow_private_inbound: bool,
     /// Permit win32k (user32/gdi32) system calls. Needed by programs that
     /// load user32 (Windows)
     #[arg(long, help_heading = "WINDOWS")]

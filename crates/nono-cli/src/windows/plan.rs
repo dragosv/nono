@@ -1,8 +1,9 @@
 //! Turning `nono run` arguments into a capability set and launch options.
 //!
-//! Policy that belongs to the CLI lives here: program resolution, the
-//! per-run temp directory, enumerate grants on ancestors, environment
-//! filtering and the session proxy.
+//! Policy that belongs to the CLI lives here: program resolution, enumerate
+//! grants on ancestors, environment filtering and the session proxy. There is no nono temp directory: PSEC sets TEMP/TMP to the
+//! container's own temp folder, which is private to the run and removed
+//! with it.
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -20,15 +21,14 @@ use super::env_sanitization::is_dangerous_env_var;
 /// Variables that carry nono's own state and never reach the workload.
 const NONO_INTERNAL_ENV: &[&str] = &["NONO_CAP_FILE", "NONO_ALLOW"];
 
-/// Everything one run needs. Dropping it stops the proxy and removes the
-/// temp directory, so it must outlive the child.
+/// Everything one run needs. Dropping it stops the proxy, so it must
+/// outlive the child.
 pub(crate) struct Plan {
     pub(crate) caps: CapabilitySet,
     pub(crate) options: LaunchOptions,
     pub(crate) win32k_allowed: bool,
     program: PathBuf,
     env_names: Vec<String>,
-    _temp: tempfile::TempDir,
     proxy: Option<Proxy>,
 }
 
@@ -78,24 +78,21 @@ impl Plan {
             caps = caps.allow_file(&program, AccessMode::Read)?;
         }
 
-        // Per-run temp directory, read+write, exported as TEMP/TMP.
-        let temp = tempfile::Builder::new()
-            .prefix("nono-")
-            .tempdir()
-            .map_err(NonoError::Io)?;
-        let temp_path = plain(&temp.path().canonicalize().map_err(NonoError::Io)?);
-        caps = caps.allow_path(&temp_path, AccessMode::ReadWrite)?;
-
         let mut proxy = None;
         if args.block_net {
             caps = caps.block_network();
         } else if !args.allow_domain.is_empty() || !args.deny_domain.is_empty() {
+            if !args.allow_private_inbound {
+                return Err(NonoError::SandboxInit(
+                    "--allow-domain/--deny-domain route traffic through nono's proxy, which on Windows also lets hosts on a private network connect to listeners in the workload. Add --allow-private-inbound to accept this, or use --block-net".to_string(),
+                ));
+            }
             let started = start_proxy(&args.allow_domain, &args.deny_domain)?;
             caps = caps.proxy_only(started.handle.port);
             proxy = Some(started);
         }
 
-        let mut env = workload_env(std::env::vars_os(), &temp_path);
+        let mut env = workload_env(std::env::vars_os());
         if let Some(proxy) = &proxy {
             for (key, value) in proxy.handle.env_vars() {
                 env.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
@@ -110,6 +107,7 @@ impl Plan {
         let mut options = LaunchOptions::new(&program, &cwd)
             .args(program_args.iter().cloned())
             .allow_win32k(args.allow_win32k)
+            .allow_private_network_inbound(args.allow_private_inbound)
             .stdio(stdio);
         for (key, value) in env {
             options = options.env(key, value);
@@ -133,7 +131,6 @@ impl Plan {
             win32k_allowed: args.allow_win32k,
             program,
             env_names,
-            _temp: temp,
             proxy,
         })
     }
@@ -242,17 +239,14 @@ fn start_proxy(allow: &[String], deny: &[String]) -> Result<Proxy> {
     })
 }
 
-/// Host environment minus loader/interpreter injection variables and nono's
-/// own state, with TEMP/TMP pointing at the per-run temp directory.
+/// Host environment minus loader/interpreter injection variables, nono's own
+/// state and the host's TEMP/TMP (PSEC supplies the container's own).
 ///
 /// A variable whose name is not valid Unicode cannot be checked against the
 /// filters, so it is dropped. Values pass through unchanged.
-fn workload_env(
-    host: impl Iterator<Item = (OsString, OsString)>,
-    temp: &Path,
-) -> Vec<(OsString, OsString)> {
+fn workload_env(host: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
     let mut skipped = 0usize;
-    let mut env: Vec<(OsString, OsString)> = host
+    let env: Vec<(OsString, OsString)> = host
         .filter(|(key, _)| {
             let Some(key) = key.to_str() else {
                 skipped = skipped.saturating_add(1);
@@ -273,9 +267,6 @@ fn workload_env(
             "nono: {skipped} environment variable(s) with a non-Unicode name were not passed to the workload"
         );
     }
-    let temp = temp.as_os_str().to_os_string();
-    env.push(("TEMP".into(), temp.clone()));
-    env.push(("TMP".into(), temp));
     env
 }
 
@@ -395,7 +386,7 @@ mod tests {
     }
 
     fn kept(host: &[(OsString, OsString)]) -> Vec<String> {
-        workload_env(host.iter().cloned(), Path::new(r"C:\t"))
+        workload_env(host.iter().cloned())
             .into_iter()
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect()
@@ -421,7 +412,7 @@ mod tests {
             "NONO_CAP_FILE",
             "TEMP",
         ]));
-        assert_eq!(names, ["PATH", "TEMP", "TMP"]);
+        assert_eq!(names, ["PATH"]);
     }
 
     #[test]
@@ -431,7 +422,7 @@ mod tests {
         let mut host = pairs(&["PATH"]);
         host.push((lone_surrogate.clone(), "x".into()));
         host.push(("KEEP".into(), lone_surrogate));
-        assert_eq!(kept(&host), ["PATH", "KEEP", "TEMP", "TMP"]);
+        assert_eq!(kept(&host), ["PATH", "KEEP"]);
     }
 
     #[test]

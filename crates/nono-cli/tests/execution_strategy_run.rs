@@ -11,6 +11,11 @@
 //!
 //! AF_UNIX mediation integration tests live in `socket_access_run.rs`.
 
+// Unix only: exercises `nono wrap` and supervised execution,
+// which the Windows front end (src/windows/) does not implement.
+// Windows CLI coverage lives in windows_cli.rs.
+#![cfg(unix)]
+
 use nono_test_support::{Argv, Completed, NonoTest, Profile, Sandboxed, Sandboxing, nono_test};
 use std::fs;
 use std::net::TcpListener;

@@ -31,7 +31,7 @@ fn init_temp_git_repo(dir: &Path) {
 }
 
 fn run_script(script: &Path, cwd: &Path) -> std::process::Output {
-    Command::new("bash")
+    nono_test_support::bash()
         .arg(script)
         .current_dir(cwd)
         .output()

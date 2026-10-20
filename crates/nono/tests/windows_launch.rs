@@ -330,14 +330,77 @@ fn proxy_only_reaches_only_the_proxy_port() {
         .unwrap()
         .proxy_only(proxy_port);
 
+    let curl = |port| curl(&fx, port).allow_private_network_inbound(true);
+
     let served = serve_once(proxy);
-    let out = run(&caps, &curl(&fx, proxy_port));
+    let out = run(&caps, &curl(proxy_port));
     assert_eq!(out.code, 0, "proxy port unreachable: {}", out.stderr);
     assert!(served.join().unwrap());
 
     let _other_server = serve_once(other);
-    let out = run(&caps, &curl(&fx, other_port));
+    let out = run(&caps, &curl(other_port));
     assert_ne!(out.code, 0, "a non-proxy loopback port was reachable");
+}
+
+/// A verbatim path may name `safe.`, a directory distinct from `safe`.
+/// Emitted without the prefix, a grant on it also opened `safe` (observed on
+/// build 26300), so such paths are refused.
+#[test]
+fn verbatim_name_with_trailing_dot_is_refused() {
+    if !psec_or_skip() {
+        return;
+    }
+    let fx = Fixture::new();
+    let dotted = format!(r"\\?\{}.", fx.path("un").display());
+    fs::create_dir_all(&dotted).unwrap();
+    let caps = CapabilitySet::new()
+        .allow_path(fx.path("rw"), AccessMode::ReadWrite)
+        .unwrap()
+        .allow_path(&dotted, AccessMode::Read)
+        .unwrap();
+    let err = Sandbox::launch(&caps, &fx.cmd("exit 0")).err();
+    assert!(
+        err.as_ref()
+            .is_some_and(|e| e.to_string().contains("dot or space")),
+        "{err:?}"
+    );
+}
+
+/// Inside the sandbox, a read-only file grant that sits in a read-write
+/// tree can be neither deleted nor shadowed by a junction to an ungranted
+/// directory.
+#[test]
+fn file_grant_cannot_be_replaced_from_inside() {
+    if !psec_or_skip() {
+        return;
+    }
+    let fx = Fixture::new();
+    fs::create_dir_all(fx.path(r"rw\sub")).unwrap();
+    fs::write(fx.path(r"rw\sub\f.txt"), "file-grant").unwrap();
+    let caps = CapabilitySet::new()
+        .allow_path(fx.path("rw"), AccessMode::ReadWrite)
+        .unwrap()
+        .allow_file(fx.path(r"rw\sub\f.txt"), AccessMode::Read)
+        .unwrap();
+
+    let out = run(&caps, &fx.cmd(r"type sub\f.txt"));
+    assert!(
+        out.stdout.contains("file-grant"),
+        "positive control: {}",
+        out.stderr
+    );
+
+    let script = format!(
+        r"del sub\f.txt & mklink /J sub\j {} & type sub\j\secret.txt",
+        fx.path("un").display()
+    );
+    let out = run(&caps, &fx.cmd(&script));
+    assert!(
+        fx.path(r"rw\sub\f.txt").exists(),
+        "the file grant was deleted"
+    );
+    assert!(!out.stdout.contains("secret"), "{}", out.stdout);
+    assert!(!fx.path(r"rw\sub\j").exists(), "a junction was created");
 }
 
 #[test]

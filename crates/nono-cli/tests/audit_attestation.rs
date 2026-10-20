@@ -1,5 +1,10 @@
 //! Integration tests for supervisor-side audit attestation.
 
+// Unix only: exercises `nono trust` and `nono audit verify`,
+// which the Windows front end (src/windows/) does not implement.
+// Windows CLI coverage lives in windows_cli.rs.
+#![cfg(unix)]
+
 use nono_test_support::{KeyRef, NonoTest, Rollback, nono_test};
 use serde_json::Value;
 use std::fs;

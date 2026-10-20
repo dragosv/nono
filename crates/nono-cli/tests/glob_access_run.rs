@@ -1,6 +1,11 @@
 //! Kernel-level checks that `filesystem.read`/`write`/`bypass_protection`
 //! globs match existing files correctly, with proper read/write separation.
 
+// Unix only: exercises glob grants and write-only access,
+// which the Windows front end (src/windows/) does not implement.
+// Windows CLI coverage lives in windows_cli.rs.
+#![cfg(unix)]
+
 use nono_test_support::{Argv, nono_test};
 use std::fs;
 

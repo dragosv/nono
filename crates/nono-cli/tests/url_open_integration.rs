@@ -4,6 +4,11 @@
 //! connects to a supervisor socket, sends an OpenUrl request, and processes
 //! the response. The tests run the actual CLI binary as a subprocess.
 
+// Unix only: exercises the supervisor socket (`nono open-url-helper`),
+// which the Windows front end (src/windows/) does not implement.
+// Windows CLI coverage lives in windows_cli.rs.
+#![cfg(unix)]
+
 use nono::supervisor::SupervisorListener;
 use nono::supervisor::types::{SupervisorMessage, SupervisorResponse};
 use std::process::Command;

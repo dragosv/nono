@@ -1,5 +1,10 @@
 //! Integration tests for `nono run --config <manifest>`.
 
+// Unix only: exercises `--config` manifests,
+// which the Windows front end (src/windows/) does not implement.
+// Windows CLI coverage lives in windows_cli.rs.
+#![cfg(unix)]
+
 use nono_test_support::{Argv, NonoTest, nono_test};
 use std::fs;
 use std::path::PathBuf;

@@ -5,6 +5,11 @@
 //! exit status was replaced. The gap in the chain is still fail-closed — a clean run is downgraded
 //! to `1` — but only after the rest of the bookkeeping has run.
 
+// Unix only: exercises the audit ledger of supervised runs,
+// which the Windows front end (src/windows/) does not implement.
+// Windows CLI coverage lives in windows_cli.rs.
+#![cfg(unix)]
+
 use nono_test_support::{Argv, nono_test};
 use std::fs;
 use std::path::Path;
