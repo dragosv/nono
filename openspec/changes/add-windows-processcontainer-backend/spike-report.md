@@ -307,7 +307,7 @@ accepted (groups 3+).
 
 **Library** (`Sandbox::launch`, `render_launch_policy`, `windows_support`;
 `LaunchOptions`, `LaunchStdio`, `SandboxedChild`):
-- 21 unit tests: path validation, spec round-trip, quoting, batch refusal,
+- 24 unit tests: path validation, spec round-trip, quoting, batch refusal,
   environment block, field rejection, redaction.
 - 14 end-to-end tests under PSEC (`crates/nono/tests/windows_launch.rs`,
   `NONO_REQUIRE_ENFORCEMENT=1`) with positive controls in every denial
@@ -347,6 +347,25 @@ accepted (groups 3+).
   concern, as with `std::process::Command`.
 - **Build prerequisite.** `aws-lc-sys` needs clang-cl on Windows ARM64 (LLVM
   23.1.3 installed). Without it, nothing in the workspace builds there.
+
+**Review fixes (2026-10-20):**
+- Program names Windows would reinterpret (`run.bat.`, `run.bat `,
+  `run.bat::$DATA`) are refused, so they cannot get past the batch argument
+  filter. The CLI already normalized them through `std::path::absolute`.
+- Job UI limits are always set. With `--allow-win32k`, a confined
+  `Get-Clipboard` fails ("Requested Clipboard operation did not succeed"),
+  while git still works.
+- `max_processes` is refused; `memory_bytes` is shown as a committed-memory
+  cap.
+- The CLI environment is read with `vars_os`, so a non-Unicode variable no
+  longer panics: a non-Unicode name is dropped. It also filters the Windows
+  profiler, loader and shim variables (`COR_*PROFIL*`,
+  `CORECLR_*PROFIL*`, `DOTNET_ADDITIONAL_DEPS`, `DOTNET_SHARED_STORE`,
+  `__COMPAT_LAYER`).
+- Child stdio handles are inheritable only around `CreateProcessW`.
+- In the interactive path, Ctrl-Break ends the sandbox and the console modes
+  are restored. The stdin relay thread owns its pipe handle, so it never
+  writes to a closed handle.
 
 **Open:**
 - 13 pre-existing `nono` unit tests fail on Windows. They assume Unix PATH

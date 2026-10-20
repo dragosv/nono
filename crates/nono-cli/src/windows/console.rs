@@ -20,24 +20,24 @@ use std::ptr::{null, null_mut};
 use std::time::Duration;
 
 use nono::{LaunchStdio, NonoError, Result, Sandbox};
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{
-    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, COORD, ClosePseudoConsole, CreatePseudoConsole,
-    DISABLE_NEWLINE_AUTO_RETURN, ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle,
-    HPCON, ResizePseudoConsole, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
-    SetConsoleMode,
+    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, COORD, CTRL_BREAK_EVENT, CTRL_C_EVENT,
+    ClosePseudoConsole, CreatePseudoConsole, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_PROCESSED_OUTPUT,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
+    GetConsoleScreenBufferInfo, GetStdHandle, HPCON, ResizePseudoConsole, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
@@ -332,12 +332,21 @@ pub(crate) fn run_interactive() -> Result<u32> {
     let job = kill_on_close_job()?;
     let shim = spawn_shim(&console, &job)?;
 
+    // In raw mode Ctrl-C reaches the pseudo console as a byte, but Ctrl-Break
+    // still raises a console event. It ends the sandbox; the handler keeps
+    // nono alive so the console modes are restored on the way out.
+    install_break_handler();
+
     // Relays: user console → pseudo console, pseudo console → user console.
     let modes = ConsoleModes::enter_raw()?;
-    let input_raw = input_write.as_raw_handle() as usize;
     let stdin_raw = std_handle(STD_INPUT_HANDLE) as usize;
-    // Detached: blocks in ReadFile on the user's console until exit.
-    std::thread::spawn(move || pump(stdin_raw, input_raw));
+    // Detached: blocks in ReadFile on the user's console until exit. The
+    // thread owns the pipe's write end, so the handle stays valid for as
+    // long as it may write to it.
+    std::thread::spawn(move || {
+        let input_write = input_write;
+        pump(stdin_raw, input_write.as_raw_handle() as usize);
+    });
     let output_raw = output_read.as_raw_handle() as usize;
     let stdout_raw = std_handle(STD_OUTPUT_HANDLE) as usize;
     let output = std::thread::spawn(move || pump(output_raw, stdout_raw));
@@ -359,8 +368,17 @@ pub(crate) fn run_interactive() -> Result<u32> {
         }
     });
 
-    // SAFETY: live process handle.
-    let waited = unsafe { WaitForSingleObject(shim.as_raw_handle(), INFINITE) };
+    let waited = loop {
+        if BREAK.load(std::sync::atomic::Ordering::SeqCst) {
+            // SAFETY: live job handle; ends the shim and the workload.
+            unsafe { TerminateJobObject(job.as_raw_handle(), STATUS_CONTROL_C_EXIT) };
+        }
+        // SAFETY: live process handle.
+        match unsafe { WaitForSingleObject(shim.as_raw_handle(), 100) } {
+            WAIT_TIMEOUT => continue,
+            other => break other,
+        }
+    };
     let mut code = 1u32;
     if waited == WAIT_OBJECT_0 {
         // SAFETY: live process handle and out-pointer.
@@ -369,11 +387,31 @@ pub(crate) fn run_interactive() -> Result<u32> {
     done.store(true, std::sync::atomic::Ordering::SeqCst);
     // Closing the pseudo console flushes and ends its output stream.
     drop(console);
-    drop(input_write);
     let _ = output.join();
     drop(modes);
     drop(job);
     Ok(code)
+}
+
+/// Exit status reported for a run ended by Ctrl-Break.
+const STATUS_CONTROL_C_EXIT: u32 = 0xC000_013A;
+
+static BREAK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn install_break_handler() {
+    unsafe extern "system" fn handler(ctrl_type: u32) -> windows_sys::core::BOOL {
+        match ctrl_type {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+                BREAK.store(true, std::sync::atomic::Ordering::SeqCst);
+                1
+            }
+            // Close, logoff and shutdown: default handling.
+            _ => 0,
+        }
+    }
+    // SAFETY: registers a handler with the correct signature; it only stores
+    // to an atomic.
+    unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
 }
 
 fn spawn_shim(console: &PseudoConsole, job: &OwnedHandle) -> Result<OwnedHandle> {

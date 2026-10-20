@@ -52,6 +52,8 @@ pub(crate) fn build(policy: &WindowsPolicy, minor: u32) -> Vec<u8> {
         },
         capabilities: (!capabilities.is_empty()).then(|| capabilities.join(",")),
         disallow_win32k_system_calls: !policy.allow_win32k,
+        // UI limits are applied on the Job Object (documented semantics);
+        // this field's meaning is not documented for PSEC.
         ui_restrictions: 0,
         fs_read_write: nonempty(&policy.read_write),
         fs_read_only: nonempty(&policy.read_only),
@@ -84,6 +86,7 @@ mod tests {
             enumerate: vec![r"C:\".into()],
             network: Network::Blocked,
             allow_win32k: false,
+            memory_bytes: None,
         }
     }
 

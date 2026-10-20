@@ -18,15 +18,18 @@ use windows_sys::Win32::Foundation::{
     GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
     SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
+    JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+    JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
+    JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+    JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
@@ -305,7 +308,10 @@ pub(crate) fn render(caps: &CapabilitySet, opts: &LaunchOptions) -> Result<super
 }
 
 fn host_info() -> Result<(u32, u64)> {
-    let api = psec::api()?;
+    host_info_from(psec::api()?)
+}
+
+fn host_info_from(api: &psec::Api) -> Result<(u32, u64)> {
     let minor = api.version_supported(SCHEMA_MAJOR)?.ok_or_else(|| {
         NonoError::UnsupportedPlatform(format!(
             "Windows ProcessContainer (PSEC) does not support schema version {SCHEMA_MAJOR}.x"
@@ -316,7 +322,7 @@ fn host_info() -> Result<(u32, u64)> {
 
 pub(crate) fn launch(caps: &CapabilitySet, opts: &LaunchOptions) -> Result<SandboxedChild> {
     let api = psec::api()?;
-    let (minor, flags) = host_info()?;
+    let (minor, flags) = host_info_from(api)?;
     let policy = WindowsPolicy::from_launch(caps, opts, Some((minor, flags)))?;
 
     if !opts.program.is_absolute() {
@@ -396,6 +402,10 @@ pub(crate) fn launch(caps: &CapabilitySet, opts: &LaunchOptions) -> Result<Sandb
 
     // SAFETY: PROCESS_INFORMATION is plain data; all-zero is a valid value.
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // The child ends are inheritable only around this call, so a concurrent
+    // CreateProcess elsewhere in the caller has the shortest possible window
+    // to inherit them.
+    stdio.set_child_ends_inheritable(true)?;
     // SAFETY: every pointer references a live, NUL-terminated buffer for the
     // duration of the call; `command_line` is mutable as CreateProcessW
     // requires; handle inheritance is restricted by the handle list.
@@ -413,8 +423,12 @@ pub(crate) fn launch(caps: &CapabilitySet, opts: &LaunchOptions) -> Result<Sandb
             &mut info,
         )
     };
-    if created == 0 {
-        return Err(win32_error("CreateProcessW with the security environment"));
+    let create_error =
+        (created == 0).then(|| win32_error("CreateProcessW with the security environment"));
+    // The child holds its own duplicates; the parent keeps only its pipe ends.
+    stdio.close_child_ends();
+    if let Some(error) = create_error {
+        return Err(error);
     }
     // SAFETY: CreateProcessW succeeded, so both handles are valid and owned
     // by this function.
@@ -439,8 +453,6 @@ pub(crate) fn launch(caps: &CapabilitySet, opts: &LaunchOptions) -> Result<Sandb
         return Err(error);
     }
     drop(thread);
-    // The parent keeps only its own pipe ends.
-    stdio.close_child_ends();
 
     Ok(SandboxedChild {
         pid: info.dwProcessId,
@@ -477,19 +489,15 @@ fn create_job(limits: Option<&ResourceLimits>) -> Result<OwnedHandle> {
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     // Breakaway is not permitted (no JOB_OBJECT_LIMIT_BREAKAWAY_OK).
     let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if let Some(limits) = limits {
-        if let Some(bytes) = limits.memory_bytes {
-            info.JobMemoryLimit = usize::try_from(bytes).map_err(|_| {
-                NonoError::SandboxInit(format!("memory limit {bytes} exceeds the address space"))
-            })?;
-            flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
-        }
-        if let Some(count) = limits.max_processes {
-            info.BasicLimitInformation.ActiveProcessLimit = u32::try_from(count).map_err(|_| {
-                NonoError::SandboxInit(format!("process limit {count} is too large"))
-            })?;
-            flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        }
+    // `max_processes` is refused by the policy mapping: a job cannot limit
+    // threads. The memory cap is on committed memory, which bounds private
+    // resident memory; allocations beyond it fail instead of the tree being
+    // killed.
+    if let Some(bytes) = limits.and_then(|l| l.memory_bytes) {
+        info.JobMemoryLimit = usize::try_from(bytes).map_err(|_| {
+            NonoError::SandboxInit(format!("memory limit {bytes} exceeds the address space"))
+        })?;
+        flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
     }
     info.BasicLimitInformation.LimitFlags = flags;
     // SAFETY: live job handle; the pointer and size describe `info`.
@@ -505,8 +513,37 @@ fn create_job(limits: Option<&ResourceLimits>) -> Result<OwnedHandle> {
     {
         return Err(win32_error("SetInformationJobObject"));
     }
+    // PSEC confines win32k only by turning it off. When it is allowed, these
+    // keep the workload away from the clipboard, global atoms, other
+    // processes' windows and desktop or system settings.
+    let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+        UIRestrictionsClass: UI_RESTRICTIONS,
+    };
+    // SAFETY: live job handle; the pointer and size describe `ui`.
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectBasicUIRestrictions,
+            (&raw const ui).cast(),
+            u32::try_from(std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>())
+                .unwrap_or(u32::MAX),
+        )
+    } == 0
+    {
+        return Err(win32_error("SetInformationJobObject(UI restrictions)"));
+    }
     Ok(job)
 }
+
+/// Every job UI limit.
+const UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_DESKTOP
+    | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+    | JOB_OBJECT_UILIMIT_EXITWINDOWS
+    | JOB_OBJECT_UILIMIT_GLOBALATOMS
+    | JOB_OBJECT_UILIMIT_HANDLES
+    | JOB_OBJECT_UILIMIT_READCLIPBOARD
+    | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+    | JOB_OBJECT_UILIMIT_WRITECLIPBOARD;
 
 /// An initialised `PROC_THREAD_ATTRIBUTE_LIST`, deleted on drop.
 struct AttributeList {
@@ -584,9 +621,9 @@ impl Stdio {
                 stdio.child_owned.push(null);
             }
             LaunchStdio::Piped => {
-                let (child_in, parent_in) = pipe(Inherit::Read)?;
-                let (parent_out, child_out) = pipe(Inherit::Write)?;
-                let (parent_err, child_err) = pipe(Inherit::Write)?;
+                let (child_in, parent_in) = pipe()?;
+                let (parent_out, child_out) = pipe()?;
+                let (parent_err, child_err) = pipe()?;
                 stdio.child = Some([
                     child_in.as_raw_handle(),
                     child_out.as_raw_handle(),
@@ -606,6 +643,21 @@ impl Stdio {
         Ok(stdio)
     }
 
+    /// Toggle inheritance on the child-side handles. They are created
+    /// non-inheritable and made inheritable only for `CreateProcessW`.
+    fn set_child_ends_inheritable(&self, inheritable: bool) -> Result<()> {
+        let value = if inheritable { HANDLE_FLAG_INHERIT } else { 0 };
+        for handle in &self.child_owned {
+            // SAFETY: live handle owned by `self`.
+            if unsafe { SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, value) }
+                == 0
+            {
+                return Err(win32_error("SetHandleInformation"));
+            }
+        }
+        Ok(())
+    }
+
     fn close_child_ends(&mut self) {
         self.child = None;
         self.inherit.clear();
@@ -613,57 +665,34 @@ impl Stdio {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Inherit {
-    Read,
-    Write,
-}
-
-/// Create a pipe; only the end the child uses is inheritable.
-fn pipe(inherit: Inherit) -> Result<(OwnedHandle, OwnedHandle)> {
-    let attributes = inheritable();
+/// Create a pipe. Neither end is inheritable; see
+/// [`Stdio::set_child_ends_inheritable`].
+fn pipe() -> Result<(OwnedHandle, OwnedHandle)> {
     let (mut read, mut write): (HANDLE, HANDLE) = (null_mut(), null_mut());
-    // SAFETY: live out-pointers and security attributes.
-    if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
+    // SAFETY: live out-pointers; null attributes make both ends
+    // non-inheritable.
+    if unsafe { CreatePipe(&mut read, &mut write, null(), 0) } == 0 {
         return Err(win32_error("CreatePipe"));
     }
-    let read = owned(read, "CreatePipe")?;
-    let write = owned(write, "CreatePipe")?;
-    let parent_end = match inherit {
-        Inherit::Read => &write,
-        Inherit::Write => &read,
-    };
-    // SAFETY: live handle owned above.
-    if unsafe { SetHandleInformation(parent_end.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) } == 0 {
-        return Err(win32_error("SetHandleInformation"));
-    }
-    Ok((read, write))
+    Ok((owned(read, "CreatePipe")?, owned(write, "CreatePipe")?))
 }
 
 fn open_null() -> Result<OwnedHandle> {
-    let attributes = inheritable();
     let name = super::wide("NUL");
-    // SAFETY: NUL-terminated name and live security attributes.
+    // SAFETY: NUL-terminated name; null attributes make the handle
+    // non-inheritable.
     let handle = unsafe {
         CreateFileW(
             name.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &attributes,
+            null(),
             OPEN_EXISTING,
             0,
             null_mut(),
         )
     };
     owned(handle, "CreateFileW(NUL)")
-}
-
-fn inheritable() -> SECURITY_ATTRIBUTES {
-    SECURITY_ATTRIBUTES {
-        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
-        lpSecurityDescriptor: null_mut(),
-        bInheritHandle: 1,
-    }
 }
 
 /// `\\?\X:\rest` → `X:\rest`. Canonical paths come back in verbatim form,
@@ -707,6 +736,24 @@ pub(crate) fn command_line(program: &Path, args: &[OsString]) -> Result<Vec<u16>
     if program_wide.contains(&0) || program_wide.contains(&QUOTE) {
         return Err(NonoError::SandboxInit(format!(
             "program path cannot be quoted: {}",
+            program.display()
+        )));
+    }
+    // Windows drops trailing dots and spaces from the file name and resolves
+    // `name:stream` to a data stream, so `run.bat.`, `run.bat ` and
+    // `run.bat::$DATA` would run as batch files while `extension()` sees no
+    // `bat`. Such names are refused rather than reinterpreted.
+    let file_name: Vec<u16> = program
+        .file_name()
+        .map(|n| n.encode_wide().collect())
+        .unwrap_or_default();
+    if file_name.is_empty()
+        || file_name.ends_with(&[u16::from(b'.')])
+        || file_name.ends_with(&[u16::from(b' ')])
+        || file_name.contains(&u16::from(b':'))
+    {
+        return Err(NonoError::SandboxInit(format!(
+            "program file name is ambiguous on Windows (trailing dot or space, or a data stream): {}",
             program.display()
         )));
     }
@@ -908,6 +955,28 @@ mod tests {
     #[test]
     fn program_with_quote_is_rejected() {
         assert!(line(r#"C:\a"b.exe"#, &[]).is_err());
+    }
+
+    #[test]
+    fn ambiguous_program_names_are_rejected() {
+        // Each of these runs C:\x\run.bat through cmd.exe while
+        // `extension()` reports something other than `bat` (CVE-2024-43402).
+        for program in [
+            r"C:\x\run.bat.",
+            r"C:\x\run.bat ",
+            r"C:\x\run.bat. .",
+            r"C:\x\run.bat::$DATA",
+            r"C:\x\run.exe.",
+        ] {
+            assert!(line(program, &[]).is_err(), "{program:?}");
+            assert!(line(program, &["a&calc"]).is_err(), "{program:?}");
+        }
+        assert!(line(r"C:\x.y\run.exe", &["a&b"]).is_ok());
+    }
+
+    #[test]
+    fn ui_restrictions_cover_every_limit() {
+        assert_eq!(UI_RESTRICTIONS, 0xff);
     }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {

@@ -34,6 +34,8 @@ pub(crate) struct WindowsPolicy {
     pub(crate) enumerate: Vec<String>,
     pub(crate) network: Network,
     pub(crate) allow_win32k: bool,
+    /// Job-wide committed-memory cap. Enforced by the Job Object, not PSEC.
+    pub(crate) memory_bytes: Option<u64>,
 }
 
 impl WindowsPolicy {
@@ -46,6 +48,7 @@ impl WindowsPolicy {
             enumerate: Vec::new(),
             network: Network::Blocked,
             allow_win32k: false,
+            memory_bytes: None,
         }
     }
 
@@ -145,6 +148,7 @@ impl WindowsPolicy {
             enumerate,
             network,
             allow_win32k: opts.win32k_allowed(),
+            memory_bytes: caps.resource_limits().and_then(|l| l.memory_bytes),
         })
     }
 
@@ -163,6 +167,7 @@ impl WindowsPolicy {
                 Network::Proxy { port } => RenderedNetwork::ProxyOnly { port },
             },
             win32k_allowed: self.allow_win32k,
+            memory_bytes: self.memory_bytes,
         }
     }
 }
@@ -202,6 +207,13 @@ fn reject_inexpressible(caps: &CapabilitySet) -> Result<()> {
     }
     if !caps.localhost_port_ranges().is_empty() {
         rejected.push("localhost_port_ranges");
+    }
+    if caps
+        .resource_limits()
+        .is_some_and(|l| l.max_processes.is_some())
+    {
+        // A Job Object counts processes only; the limit also covers threads.
+        rejected.push("resource_limits.max_processes (Windows cannot limit threads)");
     }
     if rejected.is_empty() {
         Ok(())
@@ -314,8 +326,13 @@ pub struct RenderedPolicy {
     pub enumerate: Vec<PathBuf>,
     /// Network policy.
     pub network: RenderedNetwork,
-    /// Whether win32k (user32/gdi32) system calls are permitted.
+    /// Whether win32k (user32/gdi32) system calls are permitted. When they
+    /// are, the job still denies clipboard, global atoms, other processes'
+    /// windows and desktop or system settings.
     pub win32k_allowed: bool,
+    /// Committed-memory cap for the whole process tree, in bytes. Allocations
+    /// beyond it fail; the tree is not killed.
+    pub memory_bytes: Option<u64>,
 }
 
 /// Network policy in display form.
@@ -365,11 +382,17 @@ impl fmt::Display for RenderedPolicy {
                 "network:   proxy-only via http://127.0.0.1:{port} (system resolver reachable)"
             )?,
         }
+        if let Some(bytes) = self.memory_bytes {
+            writeln!(
+                f,
+                "memory:    {bytes} bytes committed (allocations beyond it fail)"
+            )?;
+        }
         write!(
             f,
             "win32k:    {}",
             if self.win32k_allowed {
-                "allowed"
+                "allowed (no clipboard, global atoms, foreign windows or desktop settings)"
             } else {
                 "blocked"
             }
@@ -442,6 +465,32 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("localhost_ports"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn process_limit_is_refused_not_weakened() -> Result<()> {
+        let opts = LaunchOptions::new(r"C:\Windows\System32\whoami.exe", r"C:\");
+        let limited = |limits| {
+            let caps = CapabilitySet::new()
+                .block_network()
+                .with_resource_limits(limits);
+            WindowsPolicy::from_launch(&caps, &opts, None)
+        };
+        let err = limited(crate::ResourceLimits {
+            memory_bytes: None,
+            max_processes: Some(64),
+        })
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(err.contains("max_processes"), "{err}");
+
+        let policy = limited(crate::ResourceLimits {
+            memory_bytes: Some(1 << 30),
+            max_processes: None,
+        })?;
+        assert_eq!(policy.memory_bytes, Some(1 << 30));
         Ok(())
     }
 

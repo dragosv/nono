@@ -95,14 +95,17 @@ impl Plan {
             proxy = Some(started);
         }
 
-        let mut env = workload_env(&temp_path);
+        let mut env = workload_env(std::env::vars_os(), &temp_path);
         if let Some(proxy) = &proxy {
             for (key, value) in proxy.handle.env_vars() {
                 env.retain(|(k, _)| !k.eq_ignore_ascii_case(&key));
-                env.push((key, value));
+                env.push((key.into(), value.into()));
             }
         }
-        let env_names = env.iter().map(|(k, _)| k.clone()).collect();
+        let env_names = env
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
 
         let mut options = LaunchOptions::new(&program, &cwd)
             .args(program_args.iter().cloned())
@@ -116,14 +119,9 @@ impl Plan {
         }
         // Opt-in only: the set includes the volume root, and a volume-root
         // enumerate grant exposes every file name on the volume (observed on
-        // build 26300).
+        // build 26300). The library refuses enumerate grants on hosts without
+        // PSEC 1.1 enumeration.
         if args.enumerate_ancestors {
-            if !Sandbox::windows_support().fs_enumerate {
-                return Err(NonoError::SandboxInit(
-                    "--enumerate-ancestors needs PSEC 1.1 enumeration, which this host lacks"
-                        .to_string(),
-                ));
-            }
             for path in enumerate_ancestors(&caps, &program, &cwd) {
                 options = options.enumerate_path(path);
             }
@@ -246,22 +244,55 @@ fn start_proxy(allow: &[String], deny: &[String]) -> Result<Proxy> {
 
 /// Host environment minus loader/interpreter injection variables and nono's
 /// own state, with TEMP/TMP pointing at the per-run temp directory.
-fn workload_env(temp: &Path) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = std::env::vars()
+///
+/// A variable whose name is not valid Unicode cannot be checked against the
+/// filters, so it is dropped. Values pass through unchanged.
+fn workload_env(
+    host: impl Iterator<Item = (OsString, OsString)>,
+    temp: &Path,
+) -> Vec<(OsString, OsString)> {
+    let mut skipped = 0usize;
+    let mut env: Vec<(OsString, OsString)> = host
         .filter(|(key, _)| {
-            let upper = key.to_ascii_uppercase();
+            let Some(key) = key.to_str() else {
+                skipped = skipped.saturating_add(1);
+                return false;
+            };
             // Windows names are case-insensitive; the shared filter is not.
+            let upper = key.to_ascii_uppercase();
             !key.starts_with('=')
                 && !is_dangerous_env_var(&upper)
+                && !is_dangerous_windows_env_var(&upper)
                 && !NONO_INTERNAL_ENV.contains(&upper.as_str())
                 && upper != "TEMP"
                 && upper != "TMP"
         })
         .collect();
-    let temp = temp.display().to_string();
-    env.push(("TEMP".to_string(), temp.clone()));
-    env.push(("TMP".to_string(), temp));
+    if skipped > 0 {
+        eprintln!(
+            "nono: {skipped} environment variable(s) with a non-Unicode name were not passed to the workload"
+        );
+    }
+    let temp = temp.as_os_str().to_os_string();
+    env.push(("TEMP".into(), temp.clone()));
+    env.push(("TMP".into(), temp));
     env
+}
+
+/// Windows loader, profiler and compatibility-shim variables that make every
+/// matching process load code chosen by whoever set them. `key` is uppercase.
+fn is_dangerous_windows_env_var(key: &str) -> bool {
+    // .NET Framework and .NET (Core) profilers: COR_ENABLE_PROFILING,
+    // COR_PROFILER, COR_PROFILER_PATH{,_32,_64} and the CORECLR_ forms.
+    key == "COR_ENABLE_PROFILING"
+        || key.starts_with("COR_PROFILER")
+        || key == "CORECLR_ENABLE_PROFILING"
+        || key.starts_with("CORECLR_PROFILER")
+        // .NET host: extra dependency manifests and shared stores.
+        || key == "DOTNET_ADDITIONAL_DEPS"
+        || key == "DOTNET_SHARED_STORE"
+        // Application compatibility shims.
+        || key == "__COMPAT_LAYER"
 }
 
 /// Resolve the program without consulting the current directory: an explicit
@@ -331,11 +362,20 @@ fn enumerate_ancestors(caps: &CapabilitySet, program: &Path, cwd: &Path) -> BTre
     out
 }
 
-/// `\\?\X:\...` → `X:\...`; other forms unchanged.
+/// `\\?\X:\...` → `X:\...`; other forms unchanged. Works on path components,
+/// so non-Unicode names survive.
 pub(crate) fn plain(path: &Path) -> PathBuf {
-    let s = path.as_os_str().to_string_lossy();
-    match s.strip_prefix(r"\\?\") {
-        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => {
+                let mut plain = PathBuf::from(format!("{}:\\", char::from(drive)));
+                plain.extend(components.filter(|c| !matches!(c, Component::RootDir)));
+                plain
+            }
+            _ => path.to_path_buf(),
+        },
         _ => path.to_path_buf(),
     }
 }
@@ -354,14 +394,56 @@ mod tests {
         assert_eq!(plain(Path::new(r"D:\b")), PathBuf::from(r"D:\b"));
     }
 
+    fn kept(host: &[(OsString, OsString)]) -> Vec<String> {
+        workload_env(host.iter().cloned(), Path::new(r"C:\t"))
+            .into_iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn pairs(names: &[&str]) -> Vec<(OsString, OsString)> {
+        names.iter().map(|n| (n.into(), "x".into())).collect()
+    }
+
     #[test]
     fn workload_env_filters_injection_variables_case_insensitively() {
-        let env = [("node_options", "--require x"), ("PATH", "C:\\bin")];
-        let kept: Vec<_> = env
-            .iter()
-            .filter(|(k, _)| !is_dangerous_env_var(&k.to_ascii_uppercase()))
-            .collect();
-        assert_eq!(kept.len(), 1);
+        let names = kept(&pairs(&[
+            "node_options",
+            "PATH",
+            "Cor_Enable_Profiling",
+            "COR_PROFILER",
+            "COR_PROFILER_PATH_64",
+            "CORECLR_ENABLE_PROFILING",
+            "CORECLR_PROFILER_PATH",
+            "DOTNET_ADDITIONAL_DEPS",
+            "dotnet_startup_hooks",
+            "__COMPAT_LAYER",
+            "NONO_CAP_FILE",
+            "TEMP",
+        ]));
+        assert_eq!(names, ["PATH", "TEMP", "TMP"]);
+    }
+
+    #[test]
+    fn workload_env_drops_non_unicode_names_without_panicking() {
+        use std::os::windows::ffi::OsStringExt;
+        let lone_surrogate = OsString::from_wide(&[0xD800, u16::from(b'X')]);
+        let mut host = pairs(&["PATH"]);
+        host.push((lone_surrogate.clone(), "x".into()));
+        host.push(("KEEP".into(), lone_surrogate));
+        assert_eq!(kept(&host), ["PATH", "KEEP", "TEMP", "TMP"]);
+    }
+
+    #[test]
+    fn plain_keeps_non_unicode_components() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut wide: Vec<u16> = r"\\?\C:\a\".encode_utf16().collect();
+        wide.push(0xD800);
+        let path = PathBuf::from(OsString::from_wide(&wide));
+        let out: Vec<u16> = plain(&path).as_os_str().encode_wide().collect();
+        let mut expected: Vec<u16> = r"C:\a\".encode_utf16().collect();
+        expected.push(0xD800);
+        assert_eq!(out, expected);
     }
 
     #[test]

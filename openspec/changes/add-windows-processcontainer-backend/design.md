@@ -204,9 +204,25 @@ conflicts with the container.
 
 The command line is built with the same quoting rules as Rust `std`
 (`CommandLineToArgvW`-compatible). It refuses arguments that cannot be
-safely escaped for `.bat`/`.cmd` targets (the BatBadBut class). NUL in an
+safely escaped for `.bat`/`.cmd` targets (the BatBadBut class). A program
+file name that Windows would reinterpret (trailing dot or space, or a
+`name:stream` data stream) is refused, because `run.bat.` runs as a batch
+file while its extension reads as empty (CVE-2024-43402). NUL in an
 argument is an error. The environment block is exactly
 `LaunchOptions.env`.
+
+Child-side standard handles are created non-inheritable and made
+inheritable only around `CreateProcessW`, then closed at once. This keeps a
+concurrent `CreateProcess` in a multithreaded caller from inheriting them,
+apart from that short window.
+
+The job also carries every `JOB_OBJECT_UILIMIT_*` flag. PSEC confines win32k
+only by switching it off, so with win32k allowed the job denies the
+clipboard, global atoms, other processes' windows and desktop or system
+settings. `ResourceLimits.memory_bytes` maps to the job's committed-memory
+limit; allocations beyond it fail and the tree is not killed. The rendered
+policy shows this. `ResourceLimits.max_processes` is refused: a job counts
+processes, not threads, so it cannot enforce the documented limit.
 
 ### D9. Proxy on Windows: host `nono-proxy` via the PSEC proxy form
 `nono-proxy` runs unconfined on the host, as it does today. The spec uses
